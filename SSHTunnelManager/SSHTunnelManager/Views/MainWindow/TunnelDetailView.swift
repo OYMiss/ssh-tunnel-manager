@@ -144,7 +144,7 @@ struct TunnelDetailView: View {
             } header: {
                 Text("Port Forwarding")
             } footer: {
-                Text("Each mapping adds a -L flag to the SSH command.")
+                Text("Each mapping adds a -L (local forward) or -D (SOCKS proxy) flag to the SSH command.")
             }
 
             Section {
@@ -156,10 +156,16 @@ struct TunnelDetailView: View {
             if status == .connected {
                 Section {
                     ForEach(editedTunnel.portMappings) { mapping in
-                        UsageRow(
-                            label: ":\(mapping.localPort)",
-                            value: "http://\(mapping.localHost):\(mapping.localPort)"
-                        )
+                        if mapping.forward == .dynamic {
+                            UsageRow(label: "Proxy", value: "\(mapping.localHost):\(mapping.localPort)")
+                            UsageRow(label: "socks5h", value: "socks5h://\(mapping.localHost):\(mapping.localPort)")
+                            UsageRow(label: "socks5", value: "socks5://\(mapping.localHost):\(mapping.localPort)")
+                        } else {
+                            UsageRow(
+                                label: ":\(mapping.localPort)",
+                                value: "http://\(mapping.localHost):\(mapping.localPort)"
+                            )
+                        }
                     }
                 } header: {
                     Text("Usage")
@@ -217,7 +223,12 @@ struct TunnelDetailView: View {
     private func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
         for mapping in tunnel.portMappings {
-            cmd += " -L \(mapping.localHost):\(mapping.localPort):\(mapping.remoteHost):\(mapping.remotePort)"
+            switch mapping.forward {
+            case .local:
+                cmd += " -L \(mapping.localHost):\(mapping.localPort):\(mapping.remoteHost):\(mapping.remotePort)"
+            case .dynamic:
+                cmd += " -D \(mapping.localHost):\(mapping.localPort)"
+            }
         }
         // Neutralize login-oriented alias directives so this command is safe to
         // copy/paste for a forward (mirrors how the app launches the tunnel).
@@ -247,7 +258,14 @@ struct PortMappingEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            LabeledContent("Local") {
+            Picker("Type", selection: $mapping.forward) {
+                Text("Local Forward").tag(ForwardType.local)
+                Text("SOCKS Proxy").tag(ForwardType.dynamic)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            LabeledContent(mapping.forward == .dynamic ? "Listen" : "Local") {
                 HStack(spacing: 4) {
                     TextField("Host", text: $mapping.localHost)
                         .textFieldStyle(.roundedBorder)
@@ -263,20 +281,26 @@ struct PortMappingEditor: View {
                 }
             }
 
-            LabeledContent("Remote") {
-                HStack(spacing: 4) {
-                    TextField("Host", text: $mapping.remoteHost)
-                        .textFieldStyle(.roundedBorder)
-                        .labelsHidden()
-                        .focused($focusedField, equals: .mappingRemoteHost(mapping.id))
-                    Text(":")
-                        .foregroundStyle(.secondary)
-                    TextField("", value: $mapping.remotePort, format: .number.grouping(.never))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 70)
-                        .labelsHidden()
-                        .focused($focusedField, equals: .mappingRemotePort(mapping.id))
+            if mapping.forward == .local {
+                LabeledContent("Remote") {
+                    HStack(spacing: 4) {
+                        TextField("Host", text: $mapping.remoteHost)
+                            .textFieldStyle(.roundedBorder)
+                            .labelsHidden()
+                            .focused($focusedField, equals: .mappingRemoteHost(mapping.id))
+                        Text(":")
+                            .foregroundStyle(.secondary)
+                        TextField("", value: $mapping.remotePort, format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 70)
+                            .labelsHidden()
+                            .focused($focusedField, equals: .mappingRemotePort(mapping.id))
+                    }
                 }
+            } else {
+                Text("SOCKS5 proxy — point your app or system proxy at this address.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if canRemove {

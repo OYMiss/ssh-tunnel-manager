@@ -1,7 +1,14 @@
 import Foundation
 
+/// How a port mapping forwards traffic.
+enum ForwardType: String, Codable, Hashable {
+    case local      // ssh -L : a fixed local→remote port forward
+    case dynamic    // ssh -D : a SOCKS proxy (destinations chosen per request)
+}
+
 struct PortMapping: Identifiable, Codable, Hashable {
     var id: UUID
+    var forward: ForwardType
     var localHost: String
     var localPort: Int
     var remoteHost: String
@@ -9,16 +16,33 @@ struct PortMapping: Identifiable, Codable, Hashable {
 
     init(
         id: UUID = UUID(),
+        forward: ForwardType = .local,
         localHost: String = "127.0.0.1",
         localPort: Int = 8080,
         remoteHost: String = "127.0.0.1",
         remotePort: Int = 8080
     ) {
         self.id = id
+        self.forward = forward
         self.localHost = localHost
         self.localPort = localPort
         self.remoteHost = remoteHost
         self.remotePort = remotePort
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, forward, localHost, localPort, remoteHost, remotePort
+    }
+
+    // Custom decoder so older configs without `forward` default to .local.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        forward = try c.decodeIfPresent(ForwardType.self, forKey: .forward) ?? .local
+        localHost = try c.decode(String.self, forKey: .localHost)
+        localPort = try c.decode(Int.self, forKey: .localPort)
+        remoteHost = try c.decode(String.self, forKey: .remoteHost)
+        remotePort = try c.decode(Int.self, forKey: .remotePort)
     }
 }
 
@@ -109,7 +133,9 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     var mappingsSummary: String {
-        portMappings.map { ":\($0.localPort) → :\($0.remotePort)" }.joined(separator: ", ")
+        portMappings.map { m in
+            m.forward == .dynamic ? "SOCKS :\(m.localPort)" : ":\(m.localPort) → :\(m.remotePort)"
+        }.joined(separator: ", ")
     }
 
     var localPortsSummary: String {

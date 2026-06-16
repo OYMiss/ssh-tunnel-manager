@@ -33,7 +33,7 @@ private func killSSHProcessesForTunnel(_ tunnel: Tunnel) {
 private func findAndKillSSHProcesses(localPort: Int) {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    task.arguments = ["-f", "ssh.*-L.*:\(localPort):"]
+    task.arguments = ["-f", "ssh.*-[LD].*:\(localPort)[: ]"]
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     try? task.run()
@@ -209,12 +209,20 @@ class TunnelManager {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
 
-        // One -L flag per port mapping, all carried by a single ssh process.
+        // One forward flag per port mapping — -L for a local forward, -D for a
+        // SOCKS proxy — all carried by a single ssh process.
         var arguments = ["-N"]
         for mapping in tunnel.portMappings {
-            arguments.append(contentsOf: [
-                "-L", "\(mapping.localHost):\(mapping.localPort):\(mapping.remoteHost):\(mapping.remotePort)"
-            ])
+            switch mapping.forward {
+            case .local:
+                arguments.append(contentsOf: [
+                    "-L", "\(mapping.localHost):\(mapping.localPort):\(mapping.remoteHost):\(mapping.remotePort)"
+                ])
+            case .dynamic:
+                arguments.append(contentsOf: [
+                    "-D", "\(mapping.localHost):\(mapping.localPort)"
+                ])
+            }
         }
 
         // Connection options. In host mode always pass -p (and -i if set); in
