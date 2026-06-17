@@ -205,8 +205,22 @@ struct TunnelDetailView: View {
             Section {
                 Toggle("Compression", isOn: $editedTunnel.compression)
                     .help("Compress the data stream (-C). Can help on slow links; costs CPU.")
-                Toggle("TCP Keep-Alive", isOn: $editedTunnel.tcpKeepAlive)
-                    .help("Lower-level than Alive Interval above — detects a dead network path rather than an unresponsive ssh server.")
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle("Survive brief network drops", isOn: $editedTunnel.disableTCPKeepAlive)
+                        .help("Sets TCPKeepAlive=no, so a short outage doesn't tear the connection down at the TCP layer; the Alive Interval probes above handle liveness instead.")
+                    Text("Keeps the tunnel up through short outages instead of dropping immediately.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle("Skip host key check", isOn: $editedTunnel.skipHostKeyCheck)
+                        .help("Sets StrictHostKeyChecking=no and UserKnownHostsFile=/dev/null.")
+                    Text("For hosts recreated on the same address. Disables protection against a changed/spoofed host — use only on trusted networks.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Advanced")
             }
@@ -293,14 +307,18 @@ struct TunnelDetailView: View {
         cmd += " -o RequestTTY=no -o RemoteCommand=none -o ControlMaster=no -o ControlPath=none"
         cmd += " -o ServerAliveInterval=\(tunnel.serverAliveInterval ?? Tunnel.defaultServerAliveInterval)"
         cmd += " -o ServerAliveCountMax=\(tunnel.serverAliveCountMax ?? Tunnel.defaultServerAliveCountMax)"
+        cmd += " -o ConnectionAttempts=2 -o BatchMode=yes"
         if let connectTimeout = tunnel.connectTimeout {
             cmd += " -o ConnectTimeout=\(connectTimeout)"
         }
         if tunnel.compression {
             cmd += " -C"
         }
-        if tunnel.tcpKeepAlive {
-            cmd += " -o TCPKeepAlive=yes"
+        if tunnel.disableTCPKeepAlive {
+            cmd += " -o TCPKeepAlive=no"
+        }
+        if tunnel.skipHostKeyCheck {
+            cmd += " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         }
         if tunnel.useAlias {
             if tunnel.port != 22 {
@@ -311,7 +329,7 @@ struct TunnelDetailView: View {
                 cmd += " -p \(tunnel.port)"
             }
             if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
-                cmd += " -i \(identityFile)"
+                cmd += " -i \(identityFile) -o IdentitiesOnly=yes"
             }
         }
         cmd += " \(tunnel.host)"

@@ -65,11 +65,13 @@ struct Tunnel: Identifiable, Codable, Hashable {
     // Simple on/off connection options. Unlike the Int? options above these
     // have an unambiguous "off" state, so a plain Bool (defaulting to false)
     // is enough — no separate "use app default" case to represent.
-    var compression: Bool      // -C (compress the data stream)
-    var tcpKeepAlive: Bool     // -o TCPKeepAlive=yes — a lower-level signal
-                                // than ServerAliveInterval/CountMax above: TCP-
-                                // level dead-path detection vs. an
-                                // ssh-protocol-level liveness check.
+    var compression: Bool          // -C (compress the data stream)
+    var disableTCPKeepAlive: Bool  // -o TCPKeepAlive=no — keep the tunnel up through brief
+                                   // outages; rely on the ServerAlive probes above instead of
+                                   // TCP-level dead-path teardown. (ssh defaults to yes.)
+    var skipHostKeyCheck: Bool     // -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null —
+                                   // insecure: skips host-key verification, for hosts recreated
+                                   // on the same address.
 
     /// Fallback used when a tunnel doesn't override `serverAliveInterval`.
     static let defaultServerAliveInterval = 30
@@ -89,7 +91,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
         serverAliveInterval: Int? = nil,
         serverAliveCountMax: Int? = nil,
         compression: Bool = false,
-        tcpKeepAlive: Bool = false
+        disableTCPKeepAlive: Bool = false,
+        skipHostKeyCheck: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -103,7 +106,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
         self.serverAliveInterval = serverAliveInterval
         self.serverAliveCountMax = serverAliveCountMax
         self.compression = compression
-        self.tcpKeepAlive = tcpKeepAlive
+        self.disableTCPKeepAlive = disableTCPKeepAlive
+        self.skipHostKeyCheck = skipHostKeyCheck
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
@@ -118,13 +122,14 @@ struct Tunnel: Identifiable, Codable, Hashable {
         serverAliveInterval == other.serverAliveInterval &&
         serverAliveCountMax == other.serverAliveCountMax &&
         compression == other.compression &&
-        tcpKeepAlive == other.tcpKeepAlive
+        disableTCPKeepAlive == other.disableTCPKeepAlive &&
+        skipHostKeyCheck == other.skipHostKeyCheck
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, host, port, portMappings, identityFile, autoConnect, useAlias
         case connectTimeout, serverAliveInterval, serverAliveCountMax
-        case compression, tcpKeepAlive
+        case compression, disableTCPKeepAlive, skipHostKeyCheck
         // Legacy single-mapping fields
         case localHost, localPort, remoteHost, remotePort
     }
@@ -145,7 +150,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
         // Absent in older configs — false matches today's behavior (neither
         // flag is currently passed to ssh at all).
         compression = try container.decodeIfPresent(Bool.self, forKey: .compression) ?? false
-        tcpKeepAlive = try container.decodeIfPresent(Bool.self, forKey: .tcpKeepAlive) ?? false
+        disableTCPKeepAlive = try container.decodeIfPresent(Bool.self, forKey: .disableTCPKeepAlive) ?? false
+        skipHostKeyCheck = try container.decodeIfPresent(Bool.self, forKey: .skipHostKeyCheck) ?? false
 
         if let mappings = try container.decodeIfPresent([PortMapping].self, forKey: .portMappings),
            !mappings.isEmpty {
@@ -179,7 +185,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(serverAliveInterval, forKey: .serverAliveInterval)
         try container.encodeIfPresent(serverAliveCountMax, forKey: .serverAliveCountMax)
         try container.encode(compression, forKey: .compression)
-        try container.encode(tcpKeepAlive, forKey: .tcpKeepAlive)
+        try container.encode(disableTCPKeepAlive, forKey: .disableTCPKeepAlive)
+        try container.encode(skipHostKeyCheck, forKey: .skipHostKeyCheck)
     }
 
     var mappingsSummary: String {

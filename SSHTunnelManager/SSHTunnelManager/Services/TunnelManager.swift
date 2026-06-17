@@ -331,6 +331,10 @@ class TunnelManager {
         // non-default port.
         if !tunnel.useAlias, let identityFile = tunnel.identityFile, !identityFile.isEmpty {
             arguments.append(contentsOf: ["-i", (identityFile as NSString).expandingTildeInPath])
+            // Use only this key — don't also offer every key in the ssh-agent,
+            // which can trip the server's auth-attempt limit ("Too many
+            // authentication failures") before the right key is reached.
+            arguments.append(contentsOf: ["-o", "IdentitiesOnly=yes"])
         }
         if !tunnel.useAlias || tunnel.port != 22 {
             arguments.append(contentsOf: ["-p", "\(tunnel.port)"])
@@ -338,8 +342,14 @@ class TunnelManager {
         if tunnel.compression {
             arguments.append("-C")
         }
-        if tunnel.tcpKeepAlive {
-            arguments.append(contentsOf: ["-o", "TCPKeepAlive=yes"])
+        if tunnel.disableTCPKeepAlive {
+            arguments.append(contentsOf: ["-o", "TCPKeepAlive=no"])
+        }
+        if tunnel.skipHostKeyCheck {
+            arguments.append(contentsOf: [
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null"
+            ])
         }
 
         // Destination, then robustness/hardening options. Forcing a dedicated,
@@ -353,6 +363,10 @@ class TunnelManager {
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=\(tunnel.serverAliveInterval ?? Tunnel.defaultServerAliveInterval)",
             "-o", "ServerAliveCountMax=\(tunnel.serverAliveCountMax ?? Tunnel.defaultServerAliveCountMax)",
+            // Retry the initial connection a couple of times before giving up,
+            // and never block on an interactive prompt the GUI can't answer.
+            "-o", "ConnectionAttempts=2",
+            "-o", "BatchMode=yes",
             "-o", "RequestTTY=no",
             "-o", "RemoteCommand=none",
             "-o", "ControlMaster=no",
