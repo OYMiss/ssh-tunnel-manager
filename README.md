@@ -6,10 +6,7 @@ A lightweight macOS menu bar app for managing SSH port forwards. No electron, no
   <img src=".github/menu.png" width="30%" alt="Menu bar with grouped tunnels and per-group toggles">
 </p>
 <p align="center">
-  <img src=".github/settings.png" width="50%" alt="Tunnel settings with a local port forward">
-</p>
-<p align="center">
-  <img src=".github/socks5.png" width="50%" alt="SOCKS proxy mapping with copy-ready socks5h and socks5 URLs">
+  <img src=".github/settings.png" width="80%" alt="Tunnel settings with a local port forward">
 </p>
 <p align="center">
   <img src=".github/group.png" width="80%" alt="Grouped tunnels with a divider in the settings sidebar">
