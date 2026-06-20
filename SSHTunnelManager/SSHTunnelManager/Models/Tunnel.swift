@@ -121,7 +121,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name and autoConnect are ignored — changing them needs no reconnect.
+    /// Name, autoConnect, and port are ignored — changing them needs no reconnect.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
         portMappings == other.portMappings &&
