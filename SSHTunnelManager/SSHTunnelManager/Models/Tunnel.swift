@@ -51,7 +51,7 @@ struct PortMapping: Identifiable, Codable, Hashable {
 
 struct Tunnel: Identifiable, Codable, Hashable {
     static let defaultSSHPort = 22
-    static func effectiveSSHPort(_ port: Int?) -> Int? {
+    static func normalizedSSHPort(_ port: Int?) -> Int? {
         port == defaultSSHPort ? nil : port
     }
 
@@ -127,7 +127,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
     /// is compared after normalizing the default 22 to nil.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
-        Self.effectiveSSHPort(port) == Self.effectiveSSHPort(other.port) &&
+        Self.normalizedSSHPort(port) == Self.normalizedSSHPort(other.port) &&
         portMappings == other.portMappings &&
         identityFile == other.identityFile &&
         connectTimeout == other.connectTimeout &&

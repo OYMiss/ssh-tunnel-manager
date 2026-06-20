@@ -390,7 +390,10 @@ struct TunnelDetailView: View {
     private var sshPortBinding: Binding<String> {
         Binding(
             get: {
-                editedTunnel.port.flatMap { Tunnel.effectiveSSHPort($0) }.map(String.init) ?? ""
+                if let sshPort = Tunnel.normalizedSSHPort(editedTunnel.port) {
+                    return String(sshPort)
+                }
+                return ""
             },
             set: { newValue in
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -401,7 +404,7 @@ struct TunnelDetailView: View {
 
     private static func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
-        if let port = Tunnel.effectiveSSHPort(tunnel.port) {
+        if let port = Tunnel.normalizedSSHPort(tunnel.port) {
             cmd += " -p \(port)"
         }
         for mapping in tunnel.portMappings {
@@ -482,11 +485,11 @@ struct TunnelDetailView: View {
                 try applySSHOption(tokens[index], to: &result)
             default:
                 if token.hasPrefix("-") {
+                    // Best-effort skip for unrecognized flags that take a value,
+                    // so the next token doesn't get mistaken for the destination.
                     if index + 1 < tokens.count, !tokens[index + 1].hasPrefix("-") {
                         index += 1
                     }
-                    // Ignore SSH flags the GUI doesn't model; apply only extracts
-                    // values that have a matching field in the form.
                     break
                 }
                 result.host = token
@@ -549,6 +552,8 @@ struct TunnelDetailView: View {
             return PortMapping(localHost: parts[0], localPort: localPort, remoteHost: parts[2], remotePort: remotePort)
         case "-R":
             if parts.count == 3, let remotePort = Int(parts[0]), let localPort = Int(parts[2]) {
+                // Standard shorthand: `port:host:hostport` — bind address is
+                // left at the default because the app doesn't expose it separately.
                 return PortMapping(forward: .remote, localHost: parts[1], localPort: localPort, remotePort: remotePort)
             }
             guard parts.count == 4, let remotePort = Int(parts[1]), let localPort = Int(parts[3]) else {
