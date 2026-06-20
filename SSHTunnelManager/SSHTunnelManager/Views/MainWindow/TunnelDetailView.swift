@@ -10,6 +10,7 @@ struct TunnelDetailView: View {
     @State private var editedTunnel: Tunnel
     @State private var sshCommandText: String
     @State private var sshCommandError: String?
+    @State private var sshCommandNotice: String?
     // Derived from the working copy vs the saved tunnel, so it can never drift
     // out of sync with the actual edits (or with an immediate structural save).
     private var hasChanges: Bool { editedTunnel != tunnel }
@@ -22,7 +23,7 @@ struct TunnelDetailView: View {
         case mappingLocalHost(UUID), mappingLocalPort(UUID)
         case mappingRemoteHost(UUID), mappingRemotePort(UUID)
         case connectTimeout, aliveInterval, aliveCountMax
-        case proxyJump
+        case proxyJump, extraSSHArguments
     }
 
     init(tunnel: Tunnel) {
@@ -113,14 +114,16 @@ struct TunnelDetailView: View {
 
             Section {
                 LabeledContent("Host") {
-                    TextField("user@server.com", text: $editedTunnel.host)
+                    TextField("Host", text: $editedTunnel.host, prompt: Text(""))
                         .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
                         .focused($focusedField, equals: .host)
                 }
 
                 LabeledContent("Port") {
-                    TextField("\(Tunnel.defaultSSHPort)", text: sshPortBinding)
+                    TextField("Port", text: sshPortBinding, prompt: Text(""))
                         .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
                         .frame(width: 90)
                         .focused($focusedField, equals: .port)
                 }
@@ -274,6 +277,20 @@ struct TunnelDetailView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("Extra SSH arguments", text: Binding(
+                        get: { editedTunnel.extraSSHArguments ?? "" },
+                        set: { editedTunnel.extraSSHArguments = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .extraSSHArguments)
+                    .font(.system(.body, design: .monospaced))
+
+                    Text("Advanced flags that are not modeled above. They are preserved from Apply and passed to ssh before the destination host.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
             } header: {
                 Text("Advanced")
             }
@@ -318,6 +335,14 @@ struct TunnelDetailView: View {
                 }
                 .disabled(!hasChanges)
             }
+        }
+        .alert("Unsupported SSH Options", isPresented: Binding(
+            get: { sshCommandNotice != nil },
+            set: { if !$0 { sshCommandNotice = nil } }
+        )) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(sshCommandNotice ?? "")
         }
         .onChange(of: editedTunnel) { _, newValue in
             sshCommandText = Self.sshCommand(for: newValue)
@@ -370,9 +395,7 @@ struct TunnelDetailView: View {
             var updated = editedTunnel
             updated.host = applied.host
             updated.port = applied.port
-            if !applied.portMappings.isEmpty {
-                updated.portMappings = applied.portMappings
-            }
+            updated.portMappings = applied.portMappings
             updated.identityFile = applied.identityFile
             updated.connectTimeout = applied.connectTimeout
             updated.serverAliveInterval = applied.serverAliveInterval
@@ -380,9 +403,13 @@ struct TunnelDetailView: View {
             updated.compression = applied.compression
             updated.disableTCPKeepAlive = applied.disableTCPKeepAlive
             updated.skipHostKeyCheck = applied.skipHostKeyCheck
+            updated.extraSSHArguments = applied.extraSSHArguments.isEmpty ? nil : applied.extraSSHArguments.map(Self.shellQuote).joined(separator: " ")
             updated.proxyJump = applied.proxyJump
             editedTunnel = updated
             sshCommandError = nil
+            if !applied.extraSSHArguments.isEmpty {
+                sshCommandNotice = "Some SSH options are not represented by dedicated GUI fields. They were saved in Advanced > Extra SSH arguments and will still be passed to ssh."
+            }
             saveChanges()
         } catch {
             sshCommandError = error.localizedDescription
@@ -443,6 +470,9 @@ struct TunnelDetailView: View {
         if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
             cmd += " -i \(identityFile) -o IdentitiesOnly=yes"
         }
+        if let extraSSHArguments = tunnel.extraSSHArguments?.trimmingCharacters(in: .whitespacesAndNewlines), !extraSSHArguments.isEmpty {
+            cmd += " \(extraSSHArguments)"
+        }
         cmd += " \(tunnel.host)"
         return cmd
     }
@@ -487,12 +517,16 @@ struct TunnelDetailView: View {
             case "-o":
                 index += 1
                 guard index < tokens.count else { throw SSHCommandError.missingValue("-o") }
-                try applySSHOption(tokens[index], to: &result)
+                if !(try applySSHOption(tokens[index], to: &result)) {
+                    result.extraSSHArguments.append(contentsOf: ["-o", tokens[index]])
+                }
             default:
                 if token.hasPrefix("-") {
-                    // Ignore unmodeled flags rather than guessing whether they
-                    // take a value; the loop's index increment advances past
-                    // the flag and the next token can still become the host.
+                    result.extraSSHArguments.append(token)
+                    if index + 1 < tokens.count - 1, !tokens[index + 1].hasPrefix("-") {
+                        index += 1
+                        result.extraSSHArguments.append(tokens[index])
+                    }
                     break
                 }
                 result.host = token
@@ -503,10 +537,22 @@ struct TunnelDetailView: View {
         guard !result.host.isEmpty else {
             throw SSHCommandError.missingDestination
         }
+        guard !result.portMappings.isEmpty else {
+            throw SSHCommandError.missingPortForwarding
+        }
         return result
     }
 
-    private static func applySSHOption(_ option: String, to result: inout ParsedSSHCommand) throws {
+    private static func shellQuote(_ token: String) -> String {
+        guard !token.isEmpty else { return "''" }
+        if token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+           token.rangeOfCharacter(from: CharacterSet(charactersIn: "'\\\"")) == nil {
+            return token
+        }
+        return "'" + token.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func applySSHOption(_ option: String, to result: inout ParsedSSHCommand) throws -> Bool {
         let parts = option.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2 else {
             throw SSHCommandError.malformedOption(option)
@@ -516,20 +562,25 @@ struct TunnelDetailView: View {
         switch key {
         case "connecttimeout":
             result.connectTimeout = Int(value)
+            return true
         case "serveraliveinterval":
             result.serverAliveInterval = Int(value)
+            return true
         case "serveralivecountmax":
             result.serverAliveCountMax = Int(value)
+            return true
         case "tcpkeepalive":
             result.disableTCPKeepAlive = value.lowercased() == "no"
+            return true
         case "stricthostkeychecking":
             result.skipHostKeyCheck = value.lowercased() == "no"
-        case "userknownhostsfile":
-            // The UI only exposes the on/off host-key toggle, not the backing
-            // known-hosts file path. Preserve the toggle state and ignore the path.
-            break
+            return true
+        case "userknownhostsfile", "identitiesonly", "requesttty", "remotecommand", "controlmaster", "controlpath", "connectionattempts", "batchmode", "exitonforwardfailure":
+            // These are either represented by a higher-level toggle or generated
+            // by the app itself, so don't duplicate them in Extra SSH arguments.
+            return true
         default:
-            break
+            return false
         }
     }
 
@@ -636,6 +687,7 @@ private struct ParsedSSHCommand {
     var disableTCPKeepAlive = false
     var skipHostKeyCheck = false
     var proxyJump: String?
+    var extraSSHArguments: [String] = []
 }
 
 private enum SSHCommandError: LocalizedError {
@@ -643,6 +695,7 @@ private enum SSHCommandError: LocalizedError {
     case missingValue(String)
     case invalidPort(String)
     case missingDestination
+    case missingPortForwarding
     case invalidMapping(String)
     case malformedOption(String)
     case trailingEscape
@@ -658,6 +711,8 @@ private enum SSHCommandError: LocalizedError {
             return "Invalid port number: \(value)."
         case .missingDestination:
             return "Missing SSH destination host."
+        case .missingPortForwarding:
+            return "The SSH command must include at least one port forwarding flag (-L, -R, or -D)."
         case .invalidMapping(let spec):
             return "Couldn’t parse port mapping: \(spec)."
         case .malformedOption(let option):

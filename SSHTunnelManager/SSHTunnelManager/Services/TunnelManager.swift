@@ -140,6 +140,74 @@ private func isLocalPortOpen(_ port: Int) -> Bool {
     return rc == 0
 }
 
+private func tokenizeSSHArguments(_ arguments: String) throws -> [String] {
+    var tokens: [String] = []
+    var current = ""
+    var quote: Character?
+    var escaping = false
+
+    for character in arguments {
+        if escaping {
+            current.append(character)
+            escaping = false
+            continue
+        }
+
+        if character == "\\" && quote != "'" {
+            escaping = true
+            continue
+        }
+
+        if let activeQuote = quote {
+            if character == activeQuote {
+                quote = nil
+            } else {
+                current.append(character)
+            }
+            continue
+        }
+
+        if character == "'" || character == "\"" {
+            quote = character
+            continue
+        }
+
+        if character.isWhitespace {
+            if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        } else {
+            current.append(character)
+        }
+    }
+
+    if escaping {
+        throw ExtraSSHArgumentsError.trailingEscape
+    }
+    if quote != nil {
+        throw ExtraSSHArgumentsError.unclosedQuote
+    }
+    if !current.isEmpty {
+        tokens.append(current)
+    }
+    return tokens
+}
+
+private enum ExtraSSHArgumentsError: LocalizedError {
+    case trailingEscape
+    case unclosedQuote
+
+    var errorDescription: String? {
+        switch self {
+        case .trailingEscape:
+            return "Extra SSH arguments end with an unfinished escape."
+        case .unclosedQuote:
+            return "Extra SSH arguments have an unclosed quote."
+        }
+    }
+}
+
 /// Kill processes by PIDs from file (cleanup from previous session)
 private func killOrphanedProcesses() {
     guard FileManager.default.fileExists(atPath: pidFileURL.path) else { return }
@@ -411,14 +479,23 @@ class TunnelManager {
         if let proxyJump = tunnel.proxyJump?.trimmingCharacters(in: .whitespaces), !proxyJump.isEmpty {
             arguments.append(contentsOf: ["-J", proxyJump])
         }
+        if let extraSSHArguments = tunnel.extraSSHArguments?.trimmingCharacters(in: .whitespacesAndNewlines), !extraSSHArguments.isEmpty {
+            do {
+                arguments.append(contentsOf: try tokenizeSSHArguments(extraSSHArguments))
+            } catch {
+                lastErrors[tunnel.id] = error.localizedDescription
+                connectionStatus[tunnel.id] = .disconnected
+                logger.error("Tunnel \"\(tunnel.name, privacy: .public)\" has invalid extra SSH arguments: \(error.localizedDescription, privacy: .public)")
+                return
+            }
+        }
 
-        // Destination, then robustness/hardening options. Forcing a dedicated,
-        // forward-only connection (RequestTTY / RemoteCommand / ControlMaster /
-        // ControlPath) stops login-oriented alias directives from allocating a
-        // TTY, running a remote shell, or piggybacking on an existing master
-        // socket and making ssh exit early — which the monitor would see as a
-        // drop and respawn, causing the tunnel to flap.
-        arguments.append(host)
+        // Robustness/hardening options. Forcing a dedicated, forward-only
+        // connection (RequestTTY / RemoteCommand / ControlMaster / ControlPath)
+        // stops login-oriented alias directives from allocating a TTY, running a
+        // remote shell, or piggybacking on an existing master socket and making
+        // ssh exit early — which the monitor would see as a drop and respawn,
+        // causing the tunnel to flap.
         arguments.append(contentsOf: [
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=\(tunnel.serverAliveInterval ?? Tunnel.defaultServerAliveInterval)",
@@ -435,6 +512,8 @@ class TunnelManager {
         if let connectTimeout = tunnel.connectTimeout {
             arguments.append(contentsOf: ["-o", "ConnectTimeout=\(connectTimeout)"])
         }
+
+        arguments.append(host)
 
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice

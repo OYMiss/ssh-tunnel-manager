@@ -81,6 +81,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
     var skipHostKeyCheck: Bool     // -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null —
                                    // insecure: skips host-key verification, for hosts recreated
                                    // on the same address.
+    var extraSSHArguments: String? // Advanced ssh flags not modeled by the GUI.
 
     // -J host[:port][,host2[:port2]...] — hop through one or more
     // intermediate hosts to reach `host`, replacing a manual multi-hop ssh.
@@ -106,6 +107,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
         compression: Bool = false,
         disableTCPKeepAlive: Bool = false,
         skipHostKeyCheck: Bool = false,
+        extraSSHArguments: String? = nil,
         proxyJump: String? = nil
     ) {
         self.id = id
@@ -121,6 +123,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
         self.compression = compression
         self.disableTCPKeepAlive = disableTCPKeepAlive
         self.skipHostKeyCheck = skipHostKeyCheck
+        self.extraSSHArguments = extraSSHArguments
         self.proxyJump = proxyJump
     }
 
@@ -138,13 +141,14 @@ struct Tunnel: Identifiable, Codable, Hashable {
         compression == other.compression &&
         disableTCPKeepAlive == other.disableTCPKeepAlive &&
         skipHostKeyCheck == other.skipHostKeyCheck &&
+        extraSSHArguments == other.extraSSHArguments &&
         proxyJump == other.proxyJump
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, host, port, portMappings, identityFile, autoConnect
         case connectTimeout, serverAliveInterval, serverAliveCountMax
-        case compression, disableTCPKeepAlive, skipHostKeyCheck, proxyJump
+        case compression, disableTCPKeepAlive, skipHostKeyCheck, extraSSHArguments, proxyJump
         // Legacy single-mapping fields
         case localHost, localPort, remoteHost, remotePort
     }
@@ -166,6 +170,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
         compression = try container.decodeIfPresent(Bool.self, forKey: .compression) ?? false
         disableTCPKeepAlive = try container.decodeIfPresent(Bool.self, forKey: .disableTCPKeepAlive) ?? false
         skipHostKeyCheck = try container.decodeIfPresent(Bool.self, forKey: .skipHostKeyCheck) ?? false
+        extraSSHArguments = try container.decodeIfPresent(String.self, forKey: .extraSSHArguments)
         // Absent in older configs — nil means "connect directly", i.e. no -J.
         proxyJump = try container.decodeIfPresent(String.self, forKey: .proxyJump)
 
@@ -202,6 +207,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
         try container.encode(compression, forKey: .compression)
         try container.encode(disableTCPKeepAlive, forKey: .disableTCPKeepAlive)
         try container.encode(skipHostKeyCheck, forKey: .skipHostKeyCheck)
+        try container.encodeIfPresent(extraSSHArguments, forKey: .extraSSHArguments)
         try container.encodeIfPresent(proxyJump, forKey: .proxyJump)
     }
 
