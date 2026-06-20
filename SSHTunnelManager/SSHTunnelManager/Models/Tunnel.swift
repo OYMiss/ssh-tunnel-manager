@@ -53,11 +53,11 @@ struct Tunnel: Identifiable, Codable, Hashable {
     var id: UUID
     var name: String
     var host: String           // user@server.com or SSH config alias
-    var port: Int              // SSH port (default 22)
+    var port: Int              // SSH port (default 22; persisted for compatibility)
     var portMappings: [PortMapping]
     var identityFile: String?  // Path to identity file (~/.ssh/id_rsa)
     var autoConnect: Bool      // Connect on app launch
-    var useAlias: Bool         // Use host as SSH config alias (no -i, no -p unless non-22)
+    var useAlias: Bool         // Use host as SSH config alias (no explicit -i)
 
     // Connection hardening options. nil means "use the app's default",
     // so existing configs without these keys behave exactly as before.
@@ -121,10 +121,10 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name and autoConnect are ignored — changing them needs no reconnect.
+    /// Name, autoConnect, and port are not included in connection equivalence.
+    /// Port is no longer passed as `-p`; name/autoConnect are metadata-only.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
-        port == other.port &&
         portMappings == other.portMappings &&
         identityFile == other.identityFile &&
         useAlias == other.useAlias &&
