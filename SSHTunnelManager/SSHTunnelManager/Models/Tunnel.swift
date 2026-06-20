@@ -50,6 +50,8 @@ struct PortMapping: Identifiable, Codable, Hashable {
 }
 
 struct Tunnel: Identifiable, Codable, Hashable {
+    static let defaultSSHPort = 22
+
     var id: UUID
     var name: String
     var host: String           // user@server.com or SSH config alias
@@ -147,7 +149,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
         name = try container.decode(String.self, forKey: .name)
         host = try container.decode(String.self, forKey: .host)
         port = try container.decodeIfPresent(Int.self, forKey: .port)
-        if port == 22 { port = nil }
+        if port == Self.defaultSSHPort { port = nil }
         identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
         autoConnect = try container.decode(Bool.self, forKey: .autoConnect)
         // Absent in older configs — nil keeps the previous hardcoded behavior.

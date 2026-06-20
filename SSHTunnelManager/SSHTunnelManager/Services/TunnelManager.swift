@@ -386,7 +386,7 @@ class TunnelManager {
         }
 
         // Connection options.
-        if let port = tunnel.port {
+        if let port = tunnel.port, port != Tunnel.defaultSSHPort {
             arguments.append(contentsOf: ["-p", String(port)])
         }
         if let identityFile = tunnel.identityFile, !identityFile.isEmpty {

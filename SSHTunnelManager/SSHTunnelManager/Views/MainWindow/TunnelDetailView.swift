@@ -119,13 +119,13 @@ struct TunnelDetailView: View {
                 }
 
                 LabeledContent("Port") {
-                    TextField("22", text: sshPortBinding)
+                    TextField("\(Tunnel.defaultSSHPort)", text: sshPortBinding)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 90)
                         .focused($focusedField, equals: .port)
                 }
 
-                Text("Leave blank to use SSH’s default port 22.")
+                Text("Leave blank to use SSH’s default port \(Tunnel.defaultSSHPort).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -392,14 +392,14 @@ struct TunnelDetailView: View {
             get: { editedTunnel.port.map(String.init) ?? "" },
             set: { newValue in
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                editedTunnel.port = trimmed.isEmpty ? nil : Int(trimmed)
+                editedTunnel.port = Int(trimmed).flatMap { $0 == Tunnel.defaultSSHPort ? nil : $0 }
             }
         )
     }
 
     private static func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
-        if let port = tunnel.port {
+        if let port = tunnel.port, port != Tunnel.defaultSSHPort {
             cmd += " -p \(port)"
         }
         for mapping in tunnel.portMappings {
@@ -458,7 +458,7 @@ struct TunnelDetailView: View {
                 guard index < tokens.count, let port = Int(tokens[index]) else {
                     throw SSHCommandError.missingValue("-p")
                 }
-                result.port = port == 22 ? nil : port
+                result.port = port == Tunnel.defaultSSHPort ? nil : port
             case "-i":
                 index += 1
                 guard index < tokens.count else { throw SSHCommandError.missingValue("-i") }
@@ -480,6 +480,8 @@ struct TunnelDetailView: View {
                 try applySSHOption(tokens[index], to: &result)
             default:
                 if token.hasPrefix("-") {
+                    // Ignore SSH flags the GUI doesn't model; Apply only extracts
+                    // values that have a matching field in the form.
                     break
                 }
                 result.host = token
@@ -513,6 +515,8 @@ struct TunnelDetailView: View {
         case "stricthostkeychecking":
             result.skipHostKeyCheck = value.lowercased() == "no"
         case "userknownhostsfile":
+            // The UI only exposes the on/off host-key toggle, not the backing
+            // known-hosts file path. Preserve the toggle state and ignore the path.
             break
         default:
             break
