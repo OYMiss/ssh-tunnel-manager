@@ -51,6 +51,8 @@ struct PortMapping: Identifiable, Codable, Hashable {
 
 struct Tunnel: Identifiable, Codable, Hashable {
     static let defaultSSHPort = 22
+    /// Normalizes the GUI's default SSH port to nil so the port field can stay
+    /// blank while connection equivalence still treats nil and 22 the same.
     static func normalizedSSHPort(_ port: Int?) -> Int? {
         port == defaultSSHPort ? nil : port
     }

@@ -404,7 +404,7 @@ struct TunnelDetailView: View {
 
     private static func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
-        if let port = Tunnel.normalizedSSHPort(tunnel.port) {
+        if let port = tunnel.port {
             cmd += " -p \(port)"
         }
         for mapping in tunnel.portMappings {
@@ -460,8 +460,11 @@ struct TunnelDetailView: View {
                 break
             case "-p":
                 index += 1
-                guard index < tokens.count, let port = Int(tokens[index]) else {
+                guard index < tokens.count else {
                     throw SSHCommandError.missingValue("-p")
+                }
+                guard let port = Int(tokens[index]) else {
+                    throw SSHCommandError.invalidPort(tokens[index])
                 }
                 result.port = port
             case "-i":
@@ -485,11 +488,9 @@ struct TunnelDetailView: View {
                 try applySSHOption(tokens[index], to: &result)
             default:
                 if token.hasPrefix("-") {
-                    // Best-effort skip for unrecognized flags that take a value,
-                    // so the next token doesn't get mistaken for the destination.
-                    if index + 1 < tokens.count, !tokens[index + 1].hasPrefix("-") {
-                        index += 1
-                    }
+                    // Ignore unmodeled flags rather than guessing whether they
+                    // take a value; the next token is still eligible to be the
+                    // destination host.
                     break
                 }
                 result.host = token
@@ -552,8 +553,8 @@ struct TunnelDetailView: View {
             return PortMapping(localHost: parts[0], localPort: localPort, remoteHost: parts[2], remotePort: remotePort)
         case "-R":
             if parts.count == 3, let remotePort = Int(parts[0]), let localPort = Int(parts[2]) {
-                // Standard shorthand: `port:host:hostport` — bind address is
-                // left at the default because the app doesn't expose it separately.
+                // Standard shorthand: `port:host:hostport` — parts[1] is the
+                // destination host; the bind address stays at its default.
                 return PortMapping(forward: .remote, localHost: parts[1], localPort: localPort, remotePort: remotePort)
             }
             guard parts.count == 4, let remotePort = Int(parts[1]), let localPort = Int(parts[3]) else {
@@ -637,6 +638,7 @@ private struct ParsedSSHCommand {
 private enum SSHCommandError: LocalizedError {
     case invalidPrefix
     case missingValue(String)
+    case invalidPort(String)
     case missingDestination
     case missingMappings
     case invalidMapping(String)
@@ -649,6 +651,8 @@ private enum SSHCommandError: LocalizedError {
             return "The command must start with ssh."
         case .missingValue(let flag):
             return "Missing value for \(flag)."
+        case .invalidPort(let value):
+            return "Invalid port number: \(value)."
         case .missingDestination:
             return "Missing SSH destination host."
         case .missingMappings:
