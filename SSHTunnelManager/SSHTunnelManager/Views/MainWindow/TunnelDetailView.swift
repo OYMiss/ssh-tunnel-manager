@@ -389,17 +389,19 @@ struct TunnelDetailView: View {
 
     private var sshPortBinding: Binding<String> {
         Binding(
-            get: { editedTunnel.port.map(String.init) ?? "" },
+            get: {
+                editedTunnel.port.flatMap { Tunnel.effectiveSSHPort($0) }.map(String.init) ?? ""
+            },
             set: { newValue in
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                editedTunnel.port = Int(trimmed).flatMap { $0 == Tunnel.defaultSSHPort ? nil : $0 }
+                editedTunnel.port = Int(trimmed)
             }
         )
     }
 
     private static func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
-        if let port = tunnel.port, port != Tunnel.defaultSSHPort {
+        if let port = Tunnel.effectiveSSHPort(tunnel.port) {
             cmd += " -p \(port)"
         }
         for mapping in tunnel.portMappings {
@@ -458,7 +460,7 @@ struct TunnelDetailView: View {
                 guard index < tokens.count, let port = Int(tokens[index]) else {
                     throw SSHCommandError.missingValue("-p")
                 }
-                result.port = port == Tunnel.defaultSSHPort ? nil : port
+                result.port = port
             case "-i":
                 index += 1
                 guard index < tokens.count else { throw SSHCommandError.missingValue("-i") }
@@ -480,6 +482,9 @@ struct TunnelDetailView: View {
                 try applySSHOption(tokens[index], to: &result)
             default:
                 if token.hasPrefix("-") {
+                    if index + 1 < tokens.count, !tokens[index + 1].hasPrefix("-") {
+                        index += 1
+                    }
                     // Ignore SSH flags the GUI doesn't model; Apply only extracts
                     // values that have a matching field in the form.
                     break
@@ -535,11 +540,17 @@ struct TunnelDetailView: View {
             }
             return PortMapping(forward: .dynamic, localHost: parts[0], localPort: localPort, remotePort: localPort)
         case "-L":
+            if parts.count == 3, let localPort = Int(parts[0]), let remotePort = Int(parts[2]) {
+                return PortMapping(localPort: localPort, remotePort: remotePort)
+            }
             guard parts.count == 4, let localPort = Int(parts[1]), let remotePort = Int(parts[3]) else {
                 throw SSHCommandError.invalidMapping(spec)
             }
             return PortMapping(localHost: parts[0], localPort: localPort, remoteHost: parts[2], remotePort: remotePort)
         case "-R":
+            if parts.count == 3, let remotePort = Int(parts[0]), let localPort = Int(parts[2]) {
+                return PortMapping(forward: .remote, localPort: localPort, remotePort: remotePort)
+            }
             guard parts.count == 4, let remotePort = Int(parts[1]), let localPort = Int(parts[3]) else {
                 throw SSHCommandError.invalidMapping(spec)
             }

@@ -51,11 +51,14 @@ struct PortMapping: Identifiable, Codable, Hashable {
 
 struct Tunnel: Identifiable, Codable, Hashable {
     static let defaultSSHPort = 22
+    static func effectiveSSHPort(_ port: Int?) -> Int? {
+        port == defaultSSHPort ? nil : port
+    }
 
     var id: UUID
     var name: String
     var host: String           // user@server.com or SSH config alias
-    var port: Int?             // SSH port; nil means the default 22
+    var port: Int?             // SSH port; nil or 22 means the default 22
     var portMappings: [PortMapping]
     var identityFile: String?  // Path to identity file (~/.ssh/id_rsa)
     var autoConnect: Bool      // Connect on app launch
@@ -123,7 +126,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
     /// Name and autoConnect are not included in connection equivalence.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
-        port == other.port &&
+        Self.effectiveSSHPort(port) == Self.effectiveSSHPort(other.port) &&
         portMappings == other.portMappings &&
         identityFile == other.identityFile &&
         connectTimeout == other.connectTimeout &&
@@ -149,7 +152,6 @@ struct Tunnel: Identifiable, Codable, Hashable {
         name = try container.decode(String.self, forKey: .name)
         host = try container.decode(String.self, forKey: .host)
         port = try container.decodeIfPresent(Int.self, forKey: .port)
-        if port == Self.defaultSSHPort { port = nil }
         identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
         autoConnect = try container.decode(Bool.self, forKey: .autoConnect)
         // Absent in older configs — nil keeps the previous hardcoded behavior.
