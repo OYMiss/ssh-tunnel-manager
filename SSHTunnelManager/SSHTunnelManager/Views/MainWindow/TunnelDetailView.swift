@@ -395,17 +395,8 @@ struct TunnelDetailView: View {
         if let proxyJump = tunnel.proxyJump?.trimmingCharacters(in: .whitespaces), !proxyJump.isEmpty {
             cmd += " -J \(proxyJump)"
         }
-        if tunnel.useAlias {
-            if tunnel.port != 22 {
-                cmd += " -p \(tunnel.port)"
-            }
-        } else {
-            if tunnel.port != 22 {
-                cmd += " -p \(tunnel.port)"
-            }
-            if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
-                cmd += " -i \(identityFile) -o IdentitiesOnly=yes"
-            }
+        if !tunnel.useAlias, let identityFile = tunnel.identityFile, !identityFile.isEmpty {
+            cmd += " -i \(identityFile) -o IdentitiesOnly=yes"
         }
         cmd += " \(tunnel.host)"
         return cmd
