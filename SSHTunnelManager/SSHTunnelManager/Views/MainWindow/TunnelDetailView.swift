@@ -370,7 +370,9 @@ struct TunnelDetailView: View {
             var updated = editedTunnel
             updated.host = applied.host
             updated.port = applied.port
-            updated.portMappings = applied.portMappings
+            if !applied.portMappings.isEmpty {
+                updated.portMappings = applied.portMappings
+            }
             updated.identityFile = applied.identityFile
             updated.connectTimeout = applied.connectTimeout
             updated.serverAliveInterval = applied.serverAliveInterval
@@ -489,8 +491,8 @@ struct TunnelDetailView: View {
             default:
                 if token.hasPrefix("-") {
                     // Ignore unmodeled flags rather than guessing whether they
-                    // take a value; the next token is still eligible to be the
-                    // destination host.
+                    // take a value; the loop's index increment advances past
+                    // the flag and the next token can still become the host.
                     break
                 }
                 result.host = token
@@ -501,15 +503,14 @@ struct TunnelDetailView: View {
         guard !result.host.isEmpty else {
             throw SSHCommandError.missingDestination
         }
-        guard !result.portMappings.isEmpty else {
-            throw SSHCommandError.missingMappings
-        }
         return result
     }
 
     private static func applySSHOption(_ option: String, to result: inout ParsedSSHCommand) throws {
         let parts = option.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2 else { return }
+        guard parts.count == 2 else {
+            throw SSHCommandError.malformedOption(option)
+        }
         let key = parts[0].lowercased()
         let value = String(parts[1])
         switch key {
@@ -539,6 +540,8 @@ struct TunnelDetailView: View {
             if parts.count == 1, let localPort = Int(parts[0]) {
                 return PortMapping(forward: .dynamic, localPort: localPort, remotePort: 0)
             }
+            // Standard shorthand: `bind_address:port` — parts[0] is the bind
+            // address, parts[1] is the listen port.
             guard parts.count == 2, let localPort = Int(parts[1]) else {
                 throw SSHCommandError.invalidMapping(spec)
             }
@@ -640,8 +643,8 @@ private enum SSHCommandError: LocalizedError {
     case missingValue(String)
     case invalidPort(String)
     case missingDestination
-    case missingMappings
     case invalidMapping(String)
+    case malformedOption(String)
     case trailingEscape
     case unclosedQuote
 
@@ -655,10 +658,10 @@ private enum SSHCommandError: LocalizedError {
             return "Invalid port number: \(value)."
         case .missingDestination:
             return "Missing SSH destination host."
-        case .missingMappings:
-            return "Add at least one port mapping."
         case .invalidMapping(let spec):
             return "Couldn’t parse port mapping: \(spec)."
+        case .malformedOption(let option):
+            return "Couldn’t parse SSH option: \(option)."
         case .trailingEscape:
             return "The command ends with an unfinished escape."
         case .unclosedQuote:
