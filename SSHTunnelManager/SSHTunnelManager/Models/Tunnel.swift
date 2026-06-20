@@ -123,7 +123,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name and autoConnect are not included in connection equivalence.
+    /// Name and autoConnect are not included in connection equivalence; port
+    /// is compared after normalizing the default 22 to nil.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
         Self.effectiveSSHPort(port) == Self.effectiveSSHPort(other.port) &&

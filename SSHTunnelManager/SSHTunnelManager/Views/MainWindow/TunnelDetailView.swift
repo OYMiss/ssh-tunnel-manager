@@ -485,7 +485,7 @@ struct TunnelDetailView: View {
                     if index + 1 < tokens.count, !tokens[index + 1].hasPrefix("-") {
                         index += 1
                     }
-                    // Ignore SSH flags the GUI doesn't model; Apply only extracts
+                    // Ignore SSH flags the GUI doesn't model; apply only extracts
                     // values that have a matching field in the form.
                     break
                 }
@@ -533,12 +533,12 @@ struct TunnelDetailView: View {
         switch flag {
         case "-D":
             if parts.count == 1, let localPort = Int(parts[0]) {
-                return PortMapping(forward: .dynamic, localPort: localPort, remotePort: localPort)
+                return PortMapping(forward: .dynamic, localPort: localPort, remotePort: 0)
             }
             guard parts.count == 2, let localPort = Int(parts[1]) else {
                 throw SSHCommandError.invalidMapping(spec)
             }
-            return PortMapping(forward: .dynamic, localHost: parts[0], localPort: localPort, remotePort: localPort)
+            return PortMapping(forward: .dynamic, localHost: parts[0], localPort: localPort, remotePort: 0)
         case "-L":
             if parts.count == 3, let localPort = Int(parts[0]), let remotePort = Int(parts[2]) {
                 return PortMapping(localPort: localPort, remotePort: remotePort)
@@ -549,7 +549,7 @@ struct TunnelDetailView: View {
             return PortMapping(localHost: parts[0], localPort: localPort, remoteHost: parts[2], remotePort: remotePort)
         case "-R":
             if parts.count == 3, let remotePort = Int(parts[0]), let localPort = Int(parts[2]) {
-                return PortMapping(forward: .remote, localPort: localPort, remotePort: remotePort)
+                return PortMapping(forward: .remote, localHost: parts[1], localPort: localPort, remotePort: remotePort)
             }
             guard parts.count == 4, let remotePort = Int(parts[1]), let localPort = Int(parts[3]) else {
                 throw SSHCommandError.invalidMapping(spec)
