@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @MainActor
 struct TunnelDetailView: View {
@@ -7,6 +8,9 @@ struct TunnelDetailView: View {
     @FocusState private var focusedField: Field?
 
     @State private var editedTunnel: Tunnel
+    @State private var sshCommandText: String
+    @State private var sshCommandError: String?
+    @State private var sshCommandNotice: String?
     // Derived from the working copy vs the saved tunnel, so it can never drift
     // out of sync with the actual edits (or with an immediate structural save).
     private var hasChanges: Bool { editedTunnel != tunnel }
@@ -15,16 +19,17 @@ struct TunnelDetailView: View {
     @State private var showJumpHost: Bool
 
     enum Field: Hashable {
-        case name, host, port, identityFile, alias
+        case name, host, port, identityFile
         case mappingLocalHost(UUID), mappingLocalPort(UUID)
         case mappingRemoteHost(UUID), mappingRemotePort(UUID)
         case connectTimeout, aliveInterval, aliveCountMax
-        case proxyJump
+        case proxyJump, extraSSHArguments
     }
 
     init(tunnel: Tunnel) {
         self.tunnel = tunnel
         self._editedTunnel = State(initialValue: tunnel)
+        self._sshCommandText = State(initialValue: Self.sshCommand(for: tunnel))
         self._showJumpHost = State(initialValue: !(tunnel.proxyJump ?? "").isEmpty)
     }
 
@@ -89,7 +94,12 @@ struct TunnelDetailView: View {
                         .textSelection(.enabled)
                 }
 
-                UsageRow(label: "SSH", value: sshCommand(for: editedTunnel))
+                SSHCommandEditor(
+                    command: $sshCommandText,
+                    error: $sshCommandError,
+                    onCopy: { copySSHCommand() },
+                    onApply: { applySSHCommand() }
+                )
             } header: {
                 Text("Status")
             }
@@ -103,51 +113,35 @@ struct TunnelDetailView: View {
             }
 
             Section {
-                Picker("Mode", selection: $editedTunnel.useAlias) {
-                    Text("Host").tag(false)
-                    Text("SSH Alias").tag(true)
+                LabeledContent("Host") {
+                    TextField("Host", text: $editedTunnel.host, prompt: Text(""))
+                        .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
+                        .focused($focusedField, equals: .host)
                 }
-                .pickerStyle(.segmented)
 
-                if editedTunnel.useAlias {
-                    LabeledContent("Alias") {
-                        TextField("my-server", text: $editedTunnel.host)
-                            .textFieldStyle(.roundedBorder)
-                            .labelsHidden()
-                            .focused($focusedField, equals: .alias)
-                    }
-
-                    Text("Uses ~/.ssh/config alias (no -i flag needed)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    LabeledContent("Host") {
-                        HStack(spacing: 4) {
-                            TextField("user@server.com", text: $editedTunnel.host)
-                                .textFieldStyle(.roundedBorder)
-                                .labelsHidden()
-                                .focused($focusedField, equals: .host)
-                            Text(":")
-                                .foregroundStyle(.secondary)
-                            TextField("", value: $editedTunnel.port, format: .number.grouping(.never))
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 70)
-                                .labelsHidden()
-                                .focused($focusedField, equals: .port)
-                        }
-                    }
-
-                    TextField("Identity File (optional)", text: Binding(
-                        get: { editedTunnel.identityFile ?? "" },
-                        set: { editedTunnel.identityFile = $0.isEmpty ? nil : $0 }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focusedField, equals: .identityFile)
-
-                    Text("e.g., ~/.ssh/id_rsa")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                LabeledContent("Port") {
+                    TextField("Port", text: sshPortBinding, prompt: Text(""))
+                        .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
+                        .frame(width: 90)
+                        .focused($focusedField, equals: .port)
                 }
+
+                Text("Leave blank to use SSH’s default port \(Tunnel.defaultSSHPort).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                TextField("Identity File (optional)", text: Binding(
+                    get: { editedTunnel.identityFile ?? "" },
+                    set: { editedTunnel.identityFile = $0.isEmpty ? nil : $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .focused($focusedField, equals: .identityFile)
+
+                Text("e.g., ~/.ssh/id_rsa")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 DisclosureGroup(isExpanded: $showJumpHost) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -283,6 +277,20 @@ struct TunnelDetailView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("Extra SSH arguments", text: Binding(
+                        get: { editedTunnel.extraSSHArguments ?? "" },
+                        set: { editedTunnel.extraSSHArguments = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .extraSSHArguments)
+                    .font(.system(.body, design: .monospaced))
+
+                    Text("Advanced flags that are not modeled above. They are preserved from Apply and passed to ssh before the destination host.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
             } header: {
                 Text("Advanced")
             }
@@ -328,12 +336,25 @@ struct TunnelDetailView: View {
                 .disabled(!hasChanges)
             }
         }
+        .alert("Unsupported SSH Options", isPresented: Binding(
+            get: { sshCommandNotice != nil },
+            set: { if !$0 { sshCommandNotice = nil } }
+        )) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(sshCommandNotice ?? "")
+        }
+        .onChange(of: editedTunnel) { _, newValue in
+            sshCommandText = Self.sshCommand(for: newValue)
+        }
         .onChange(of: tunnel.id) { _, _ in
             // Reload the editor only when a *different* tunnel is selected — not
             // when this tunnel's own save round-trips back through `tunnel`. The
             // latter would clobber an edit made right after an auto-save (e.g.
             // removing a port mapping just after a field blur saved the prior set).
             editedTunnel = tunnel
+            sshCommandText = Self.sshCommand(for: tunnel)
+            sshCommandError = nil
         }
         .onChange(of: focusedField) { oldValue, newValue in
             if oldValue != nil && newValue != oldValue && hasChanges {
@@ -362,8 +383,59 @@ struct TunnelDetailView: View {
         tunnelManager.updateTunnel(editedTunnel)
     }
 
-    private func sshCommand(for tunnel: Tunnel) -> String {
+    private func copySSHCommand() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sshCommandText, forType: .string)
+        sshCommandError = nil
+    }
+
+    private func applySSHCommand() {
+        do {
+            let applied = try Self.parseSSHCommand(sshCommandText)
+            var updated = editedTunnel
+            updated.host = applied.host
+            updated.port = applied.port
+            updated.portMappings = applied.portMappings
+            updated.identityFile = applied.identityFile
+            updated.connectTimeout = applied.connectTimeout
+            updated.serverAliveInterval = applied.serverAliveInterval
+            updated.serverAliveCountMax = applied.serverAliveCountMax
+            updated.compression = applied.compression
+            updated.disableTCPKeepAlive = applied.disableTCPKeepAlive
+            updated.skipHostKeyCheck = applied.skipHostKeyCheck
+            updated.extraSSHArguments = applied.extraSSHArguments.isEmpty ? nil : applied.extraSSHArguments.map(Self.shellQuote).joined(separator: " ")
+            updated.proxyJump = applied.proxyJump
+            editedTunnel = updated
+            sshCommandError = nil
+            if !applied.extraSSHArguments.isEmpty {
+                sshCommandNotice = "Some SSH options are not represented by dedicated GUI fields. They were saved in Advanced > Extra SSH arguments and will still be passed to ssh."
+            }
+            saveChanges()
+        } catch {
+            sshCommandError = error.localizedDescription
+        }
+    }
+
+    private var sshPortBinding: Binding<String> {
+        Binding(
+            get: {
+                if let sshPort = Tunnel.normalizedSSHPort(editedTunnel.port) {
+                    return String(sshPort)
+                }
+                return ""
+            },
+            set: { newValue in
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                editedTunnel.port = Int(trimmed)
+            }
+        )
+    }
+
+    private static func sshCommand(for tunnel: Tunnel) -> String {
         var cmd = "ssh -N"
+        if let port = tunnel.port {
+            cmd += " -p \(port)"
+        }
         for mapping in tunnel.portMappings {
             switch mapping.forward {
             case .local:
@@ -395,11 +467,307 @@ struct TunnelDetailView: View {
         if let proxyJump = tunnel.proxyJump?.trimmingCharacters(in: .whitespaces), !proxyJump.isEmpty {
             cmd += " -J \(proxyJump)"
         }
-        if !tunnel.useAlias, let identityFile = tunnel.identityFile, !identityFile.isEmpty {
+        if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
             cmd += " -i \(identityFile) -o IdentitiesOnly=yes"
+        }
+        if let extraSSHArguments = tunnel.extraSSHArguments?.trimmingCharacters(in: .whitespacesAndNewlines), !extraSSHArguments.isEmpty {
+            cmd += " \(extraSSHArguments)"
         }
         cmd += " \(tunnel.host)"
         return cmd
+    }
+
+    private static func parseSSHCommand(_ command: String) throws -> ParsedSSHCommand {
+        let tokens = try tokenizeSSHCommand(command)
+        guard tokens.first == "ssh" else {
+            throw SSHCommandError.invalidPrefix
+        }
+
+        var index = 1
+        var result = ParsedSSHCommand()
+        while index < tokens.count {
+            let token = tokens[index]
+            switch token {
+            case "-N":
+                break
+            case "-p":
+                index += 1
+                guard index < tokens.count else {
+                    throw SSHCommandError.missingValue("-p")
+                }
+                guard let port = Int(tokens[index]) else {
+                    throw SSHCommandError.invalidPort(tokens[index])
+                }
+                result.port = port
+            case "-i":
+                index += 1
+                guard index < tokens.count else { throw SSHCommandError.missingValue("-i") }
+                result.identityFile = tokens[index]
+            case "-J":
+                index += 1
+                guard index < tokens.count else { throw SSHCommandError.missingValue("-J") }
+                result.proxyJump = tokens[index]
+            case "-L", "-R", "-D":
+                index += 1
+                guard index < tokens.count else { throw SSHCommandError.missingValue(token) }
+                let mapping = try parsePortMapping(flag: token, spec: tokens[index])
+                result.portMappings.append(mapping)
+            case "-C":
+                result.compression = true
+            case "-o":
+                index += 1
+                guard index < tokens.count else { throw SSHCommandError.missingValue("-o") }
+                if !(try applySSHOption(tokens[index], to: &result)) {
+                    result.extraSSHArguments.append(contentsOf: ["-o", tokens[index]])
+                }
+            default:
+                if token.hasPrefix("-") {
+                    result.extraSSHArguments.append(token)
+                    if index + 1 < tokens.count - 1, !tokens[index + 1].hasPrefix("-") {
+                        index += 1
+                        result.extraSSHArguments.append(tokens[index])
+                    }
+                    break
+                }
+                result.host = token
+            }
+            index += 1
+        }
+
+        guard !result.host.isEmpty else {
+            throw SSHCommandError.missingDestination
+        }
+        guard !result.portMappings.isEmpty else {
+            throw SSHCommandError.missingPortForwarding
+        }
+        return result
+    }
+
+    private static func shellQuote(_ token: String) -> String {
+        guard !token.isEmpty else { return "''" }
+        if token.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+           token.rangeOfCharacter(from: CharacterSet(charactersIn: "'\\\"")) == nil {
+            return token
+        }
+        return "'" + token.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func applySSHOption(_ option: String, to result: inout ParsedSSHCommand) throws -> Bool {
+        let parts = option.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else {
+            throw SSHCommandError.malformedOption(option)
+        }
+        let key = parts[0].lowercased()
+        let value = String(parts[1])
+        switch key {
+        case "connecttimeout":
+            result.connectTimeout = Int(value)
+            return true
+        case "serveraliveinterval":
+            result.serverAliveInterval = Int(value)
+            return true
+        case "serveralivecountmax":
+            result.serverAliveCountMax = Int(value)
+            return true
+        case "tcpkeepalive":
+            result.disableTCPKeepAlive = value.lowercased() == "no"
+            return true
+        case "stricthostkeychecking":
+            result.skipHostKeyCheck = value.lowercased() == "no"
+            return true
+        case "userknownhostsfile", "identitiesonly", "requesttty", "remotecommand", "controlmaster", "controlpath", "connectionattempts", "batchmode", "exitonforwardfailure":
+            // These are either represented by a higher-level toggle or generated
+            // by the app itself, so don't duplicate them in Extra SSH arguments.
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func parsePortMapping(flag: String, spec: String) throws -> PortMapping {
+        let parts = spec.split(separator: ":").map(String.init)
+        switch flag {
+        case "-D":
+            if parts.count == 1, let localPort = Int(parts[0]) {
+                return PortMapping(forward: .dynamic, localPort: localPort, remotePort: 0)
+            }
+            // Standard shorthand: `bind_address:port` — parts[0] is the bind
+            // address, parts[1] is the listen port.
+            guard parts.count == 2, let localPort = Int(parts[1]) else {
+                throw SSHCommandError.invalidMapping(spec)
+            }
+            return PortMapping(forward: .dynamic, localHost: parts[0], localPort: localPort, remotePort: 0)
+        case "-L":
+            if parts.count == 3, let localPort = Int(parts[0]), let remotePort = Int(parts[2]) {
+                return PortMapping(localPort: localPort, remotePort: remotePort)
+            }
+            guard parts.count == 4, let localPort = Int(parts[1]), let remotePort = Int(parts[3]) else {
+                throw SSHCommandError.invalidMapping(spec)
+            }
+            return PortMapping(localHost: parts[0], localPort: localPort, remoteHost: parts[2], remotePort: remotePort)
+        case "-R":
+            if parts.count == 3, let remotePort = Int(parts[0]), let localPort = Int(parts[2]) {
+                // Standard shorthand: `port:host:hostport` — parts[1] is the
+                // destination host; the bind address stays at its default.
+                return PortMapping(forward: .remote, localHost: parts[1], localPort: localPort, remotePort: remotePort)
+            }
+            guard parts.count == 4, let remotePort = Int(parts[1]), let localPort = Int(parts[3]) else {
+                throw SSHCommandError.invalidMapping(spec)
+            }
+            return PortMapping(forward: .remote, localHost: parts[2], localPort: localPort, remoteHost: parts[0], remotePort: remotePort)
+        default:
+            throw SSHCommandError.invalidMapping(spec)
+        }
+    }
+
+    private static func tokenizeSSHCommand(_ command: String) throws -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+
+        for character in command {
+            if escaping {
+                current.append(character)
+                escaping = false
+                continue
+            }
+
+            if character == "\\" && quote != "'" {
+                escaping = true
+                continue
+            }
+
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                continue
+            }
+
+            if character.isWhitespace {
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(character)
+            }
+        }
+
+        if escaping {
+            throw SSHCommandError.trailingEscape
+        }
+        if quote != nil {
+            throw SSHCommandError.unclosedQuote
+        }
+        if !current.isEmpty {
+            tokens.append(current)
+        }
+        return tokens
+    }
+}
+
+private struct ParsedSSHCommand {
+    var host: String = ""
+    var port: Int?
+    var portMappings: [PortMapping] = []
+    var identityFile: String?
+    var connectTimeout: Int?
+    var serverAliveInterval: Int?
+    var serverAliveCountMax: Int?
+    var compression = false
+    var disableTCPKeepAlive = false
+    var skipHostKeyCheck = false
+    var proxyJump: String?
+    var extraSSHArguments: [String] = []
+}
+
+private enum SSHCommandError: LocalizedError {
+    case invalidPrefix
+    case missingValue(String)
+    case invalidPort(String)
+    case missingDestination
+    case missingPortForwarding
+    case invalidMapping(String)
+    case malformedOption(String)
+    case trailingEscape
+    case unclosedQuote
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidPrefix:
+            return "The command must start with ssh."
+        case .missingValue(let flag):
+            return "Missing value for \(flag)."
+        case .invalidPort(let value):
+            return "Invalid port number: \(value)."
+        case .missingDestination:
+            return "Missing SSH destination host."
+        case .missingPortForwarding:
+            return "The SSH command must include at least one port forwarding flag (-L, -R, or -D)."
+        case .invalidMapping(let spec):
+            return "Couldn’t parse port mapping: \(spec)."
+        case .malformedOption(let option):
+            return "Couldn’t parse SSH option: \(option)."
+        case .trailingEscape:
+            return "The command ends with an unfinished escape."
+        case .unclosedQuote:
+            return "The command has an unclosed quote."
+        }
+    }
+}
+
+@MainActor
+private struct SSHCommandEditor: View {
+    @Binding var command: String
+    @Binding var error: String?
+    let onCopy: () -> Void
+    let onApply: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("SSH Command")
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $command)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 90)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.quaternary)
+                }
+                .textSelection(.enabled)
+
+            if let error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                Spacer()
+
+                Button {
+                    onCopy()
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+
+                Button("Apply") {
+                    onApply()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
     }
 }
 
@@ -512,7 +880,7 @@ struct UsageRow: View {
     TunnelDetailView(tunnel: Tunnel(
         name: "Test Tunnel",
         host: "user@example.com",
-        port: 22,
+        port: nil,
         portMappings: [
             PortMapping(localPort: 8080, remotePort: 8080),
             PortMapping(localPort: 5432, remotePort: 5432)
