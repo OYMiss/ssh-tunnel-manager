@@ -53,11 +53,10 @@ struct Tunnel: Identifiable, Codable, Hashable {
     var id: UUID
     var name: String
     var host: String           // user@server.com or SSH config alias
-    var port: Int              // SSH port (default 22; persisted for compatibility)
+    var port: Int?             // SSH port; nil means the default 22
     var portMappings: [PortMapping]
     var identityFile: String?  // Path to identity file (~/.ssh/id_rsa)
     var autoConnect: Bool      // Connect on app launch
-    var useAlias: Bool         // Use host as SSH config alias (no explicit -i)
 
     // Connection hardening options. nil means "use the app's default",
     // so existing configs without these keys behave exactly as before.
@@ -90,11 +89,10 @@ struct Tunnel: Identifiable, Codable, Hashable {
         id: UUID = UUID(),
         name: String = "",
         host: String = "",
-        port: Int = 22,
+        port: Int? = nil,
         portMappings: [PortMapping] = [PortMapping()],
         identityFile: String? = nil,
         autoConnect: Bool = false,
-        useAlias: Bool = false,
         connectTimeout: Int? = nil,
         serverAliveInterval: Int? = nil,
         serverAliveCountMax: Int? = nil,
@@ -110,7 +108,6 @@ struct Tunnel: Identifiable, Codable, Hashable {
         self.portMappings = portMappings.isEmpty ? [PortMapping()] : portMappings
         self.identityFile = identityFile
         self.autoConnect = autoConnect
-        self.useAlias = useAlias
         self.connectTimeout = connectTimeout
         self.serverAliveInterval = serverAliveInterval
         self.serverAliveCountMax = serverAliveCountMax
@@ -121,13 +118,12 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name, autoConnect, and port are not included in connection equivalence.
-    /// Port is no longer passed as `-p`; name/autoConnect are metadata-only.
+    /// Name and autoConnect are not included in connection equivalence.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
+        port == other.port &&
         portMappings == other.portMappings &&
         identityFile == other.identityFile &&
-        useAlias == other.useAlias &&
         connectTimeout == other.connectTimeout &&
         serverAliveInterval == other.serverAliveInterval &&
         serverAliveCountMax == other.serverAliveCountMax &&
@@ -138,7 +134,7 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, host, port, portMappings, identityFile, autoConnect, useAlias
+        case id, name, host, port, portMappings, identityFile, autoConnect
         case connectTimeout, serverAliveInterval, serverAliveCountMax
         case compression, disableTCPKeepAlive, skipHostKeyCheck, proxyJump
         // Legacy single-mapping fields
@@ -150,10 +146,10 @@ struct Tunnel: Identifiable, Codable, Hashable {
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         host = try container.decode(String.self, forKey: .host)
-        port = try container.decode(Int.self, forKey: .port)
+        port = try container.decodeIfPresent(Int.self, forKey: .port)
+        if port == 22 { port = nil }
         identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
         autoConnect = try container.decode(Bool.self, forKey: .autoConnect)
-        useAlias = try container.decodeIfPresent(Bool.self, forKey: .useAlias) ?? false
         // Absent in older configs — nil keeps the previous hardcoded behavior.
         connectTimeout = try container.decodeIfPresent(Int.self, forKey: .connectTimeout)
         serverAliveInterval = try container.decodeIfPresent(Int.self, forKey: .serverAliveInterval)
@@ -189,11 +185,10 @@ struct Tunnel: Identifiable, Codable, Hashable {
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encode(host, forKey: .host)
-        try container.encode(port, forKey: .port)
+        try container.encodeIfPresent(port, forKey: .port)
         try container.encode(portMappings, forKey: .portMappings)
         try container.encodeIfPresent(identityFile, forKey: .identityFile)
         try container.encode(autoConnect, forKey: .autoConnect)
-        try container.encode(useAlias, forKey: .useAlias)
         try container.encodeIfPresent(connectTimeout, forKey: .connectTimeout)
         try container.encodeIfPresent(serverAliveInterval, forKey: .serverAliveInterval)
         try container.encodeIfPresent(serverAliveCountMax, forKey: .serverAliveCountMax)

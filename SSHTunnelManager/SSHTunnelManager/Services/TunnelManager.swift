@@ -385,9 +385,11 @@ class TunnelManager {
             }
         }
 
-        // Connection options. Let ~/.ssh/config (or host string) supply the SSH
-        // port; only pass explicit identity when set in host mode.
-        if !tunnel.useAlias, let identityFile = tunnel.identityFile, !identityFile.isEmpty {
+        // Connection options.
+        if let port = tunnel.port {
+            arguments.append(contentsOf: ["-p", String(port)])
+        }
+        if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
             arguments.append(contentsOf: ["-i", (identityFile as NSString).expandingTildeInPath])
             // Use only this key — don't also offer every key in the ssh-agent,
             // which can trip the server's auth-attempt limit ("Too many
@@ -694,7 +696,7 @@ class TunnelManager {
         let newTunnel = Tunnel(
             name: "New Tunnel",
             host: "user@example.com",
-            port: 22
+            port: nil
         )
         items.append(.tunnel(newTunnel))
         Task { await saveTunnels() }
