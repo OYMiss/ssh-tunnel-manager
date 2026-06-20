@@ -121,8 +121,8 @@ struct Tunnel: Identifiable, Codable, Hashable {
     }
 
     /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name, autoConnect, and port do not affect connection equivalence — changing
-    /// them needs no reconnect.
+    /// Name, autoConnect, and port are not included in connection equivalence.
+    /// Port is no longer passed as `-p`; name/autoConnect are metadata-only.
     func hasSameConnection(as other: Tunnel) -> Bool {
         host == other.host &&
         portMappings == other.portMappings &&
