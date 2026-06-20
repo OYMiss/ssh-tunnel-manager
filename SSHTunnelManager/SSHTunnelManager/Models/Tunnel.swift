@@ -269,6 +269,13 @@ enum SidebarItem: Identifiable, Hashable {
         if case .divider(let d) = self { return d }
         return nil
     }
+
+    var displayName: String {
+        switch self {
+        case .tunnel(let tunnel): return tunnel.name.isEmpty ? "tunnel" : tunnel.name
+        case .divider(let divider): return divider.title.isEmpty ? "group divider" : divider.title
+        }
+    }
 }
 
 extension SidebarItem: Codable {

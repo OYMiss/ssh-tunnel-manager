@@ -12,6 +12,7 @@ struct ContentView: View {
     @Environment(TunnelManager.self) private var tunnelManager
     @State private var selectedID: UUID?
     @State private var showPreferences = false
+    @State private var showDeleteConfirmation = false
 
     private var selectedItem: SidebarItem? {
         guard let id = selectedID else { return nil }
@@ -57,12 +58,32 @@ struct ContentView: View {
                             .help("Clone")
                         }
 
+                        Divider()
+                            .frame(height: 16)
+
+                        Button {
+                            let divider = tunnelManager.addDivider(after: item.id)
+                            selectedID = divider.id
+                        } label: {
+                            Image(systemName: "rectangle.dashed")
+                        }
+                        .help("Add a group divider")
+
+                        Button {
+                            tunnelManager.addTunnel()
+                            selectedID = tunnelManager.tunnels.last?.id
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .help("Add new tunnel")
+
                         Spacer()
 
                         Button(role: .destructive) {
-                            deleteSelected(item)
+                            showDeleteConfirmation = true
                         } label: {
                             Image(systemName: "trash")
+                                .foregroundStyle(.red)
                         }
                         .help("Delete")
                     }
@@ -91,6 +112,16 @@ struct ContentView: View {
                 .padding(.vertical, 8)
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 350)
+            .alert("Delete \(selectedItem?.displayName ?? "item")?", isPresented: $showDeleteConfirmation) {
+                Button("Delete", role: .destructive) {
+                    if let item = selectedItem {
+                        deleteSelected(item)
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This action cannot be undone.")
+            }
         } detail: {
             if let item = selectedItem {
                 switch item {

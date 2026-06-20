@@ -85,27 +85,6 @@ struct TunnelListView: View {
             .onDelete(perform: deleteItems)
         }
         .listStyle(.sidebar)
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    let divider = tunnelManager.addDivider(after: selection)
-                    selection = divider.id
-                } label: {
-                    Image(systemName: "rectangle.dashed")
-                }
-                .help("Add a group divider")
-            }
-
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    tunnelManager.addTunnel()
-                    selection = tunnelManager.tunnels.last?.id
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .help("Add new tunnel")
-            }
-        }
     }
 
     private func deleteItems(at offsets: IndexSet) {
