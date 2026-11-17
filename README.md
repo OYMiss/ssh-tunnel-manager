@@ -1,140 +1,115 @@
 # SSH Tunnel Manager
 
-A lightweight macOS menu bar app for managing SSH port forwards. No electron, no bloat — just native Swift and AppKit.
+一个以稳定和简单为目标的 macOS 原生 SwiftUI 菜单栏应用。当前版本 **2.1.1**：选择转发类型，填写 SSH 目标和端口，打开连接开关即可。
 
-<p align="center">
-  <img src=".github/menu.png" width="30%" alt="Menu bar with grouped tunnels and per-group toggles">
-</p>
-<p align="center">
-  <img src=".github/settings.png" width="80%" alt="Tunnel settings with a local port forward">
-</p>
-<p align="center">
-  <img src=".github/group.png" width="80%" alt="Grouped tunnels with a divider in the settings sidebar">
-</p>
+## 快速开始
 
-## Why?
+1. 在托盘菜单选择「管理隧道…」，点击「添加隧道」。
+2. 选择「本地」「远程」或「动态」，填写 `user@server` 或 `~/.ssh/config` 中的别名。
+3. 填写需要的端口，保存后打开连接开关。
 
-If you work with remote servers, you constantly need SSH tunnels:
-- Database access (`localhost:5432` → production PostgreSQL)
-- Internal services (`localhost:8080` → staging API)
-- A SOCKS proxy into a private network (`ssh -D`)
+SSH 端口可以留空，沿用 SSH 配置或默认端口 22。应用记住连接开关，重新打开应用后会恢复已开启的隧道。
 
-Running `ssh -N -L ...` in terminal works, but:
-- You forget which tunnels are running
-- They die silently when your laptop sleeps
-- You need to remember the exact command for each tunnel
+| 类型 | 用途 | 示例 |
+| --- | --- | --- |
+| 本地 | 在 Mac 上访问服务器侧的服务 | Mac 的 `localhost:8080` → 服务器的 `localhost:80` |
+| 远程 | 在服务器上访问 Mac 侧的服务 | 服务器的 `localhost:8080` → Mac 的 `localhost:3000` |
+| 动态 | 通过 SSH 服务器提供 SOCKS5 代理 | 在客户端应用中设置 SOCKS5 `127.0.0.1:1080` |
 
-This app solves that. Configure once, connect with one click.
+简单配置新建的转发默认监听 `127.0.0.1`。服务地址是从转发另一端访问的地址：本地转发由服务器访问目标服务，远程转发由 Mac 访问目标服务。动态代理需要在使用代理的应用中单独设置。
 
-## Features
+## 首次连接与手动命令
 
-- **Menu bar app** — always accessible, no dock icon clutter
-- **Multiple port forwards per tunnel** — one SSH connection, many `-L` / `-R` mappings
-- **SOCKS proxy** — per-mapping dynamic forwarding (`ssh -D`), mixable with local forwards
-- **Remote forwards** — expose a local service through the server (`ssh -R`) — a self-hosted way out
-- **Jump host** — reach a host behind a bastion (`ssh -J`), multi-hop chains included
-- **Group tunnels** — organize them with dividers and flip a whole group with one toggle
-- **Auto-reconnect** — tunnels automatically reconnect when they drop
-- **Failure reasons** — a failed or dropped tunnel shows *why* (auth, refused, unreachable, DNS, host-key change, port in use), not just "disconnected"
-- **Connect/disconnect alerts** — optional sound and notification when a tunnel drops or comes back
-- **Port-conflict guard** — warns when two tunnels want the same local port and stops them from clobbering each other
-- **Per-tunnel tuning** — `ConnectTimeout`, keepalive, compression, "survive brief network drops", and host-key options where a host needs them
-- **SSH config aliases** — reuse hosts from your `~/.ssh/config`
-- **Launch at login** — start tunnels when your Mac boots
-- **Auto-connect** — mark tunnels to connect automatically on app launch
-- **Native macOS** — uses system SSH, no bundled binaries
+展开「首次连接帮助」，复制登录命令到终端，确认服务器指纹并检查能否登录。配置好 SSH 密钥或 ssh-agent 后，再打开隧道开关。登录检查会禁用端口转发，可以与已运行的隧道同时使用。
 
-## Alternatives
+应用沿用现有 SSH 配置、密钥和跳板机，不保存登录密码。需要手动 setup 时在终端完成。
 
-| App | Issues |
-|-----|--------|
-| **Core Tunnel** | $10, closed source |
-| **Secure Pipes** | Abandoned (last update 2019) |
-| **SSH Tunnel Manager (Java)** | Requires JRE, clunky UI |
-| **Termius** | Subscription model, overkill for just tunnels |
-| **Manual terminal** | No auto-reconnect, easy to forget |
+复杂连接可以切换到「手动命令」，例如多个转发、指定密钥、跳板机或其他监听地址：
 
-This app is free, open source, and does one thing well.
+```sh
+# 本地转发
+ssh -N -L 127.0.0.1:8080:localhost:80 user@server
 
-## Install
+# 远程转发
+ssh -N -R 127.0.0.1:8080:localhost:3000 user@server
 
-Download `SSHTunnelManager.dmg` from [Releases](../../releases).
+# 动态代理
+ssh -N -D 127.0.0.1:1080 my-server
 
-On first launch, macOS will warn about unsigned app:
-1. Right-click the app → Open, or
-2. System Settings → Privacy & Security → Open Anyway
-
-## Build from source
-
-```bash
-git clone https://github.com/0fuz/ssh-tunnel-manager.git
-cd ssh-tunnel-manager/SSHTunnelManager
-xcodebuild -scheme SSHTunnelManager -configuration Release
+# 使用跳板机和指定密钥
+ssh -N -J jump-host -i ~/.ssh/id_ed25519 -L 8080:localhost:80 user@server
 ```
 
-Requires Xcode 15+ and macOS 14+.
+简单表单和手动编辑共用同一条 SSH 命令。兼容的单端口命令会自动回填表单，并保留原有连接选项和监听地址；复杂命令继续使用手动编辑。未修改配置时保存不会重启连接。
 
-## Usage
+命令通过 `/usr/bin/ssh` 的参数执行，不经过 shell。支持显式 TCP `-L`、`-R`、`-D` 转发及对应的 `-o` 选项；不支持 shell 运算符、远程命令、后台运行或复用控制命令。
 
-1. Click the network icon in menu bar
-2. Click "Settings" to add tunnels
-3. Toggle tunnels on/off from the menu bar
+## 精简托盘
 
-Config is stored in `~/Library/Application Support/SSHTunnelManager/tunnels.json`.
+- 每行只显示「名称 · 端口」，点击即可开关连接。
+- 状态通过图标表示，顶部显示已连接数量。
+- 悬停查看完整名称、转发类型和错误信息；主窗口保留详细状态。
+- 长名称自动缩短，多端口只显示前两个及剩余数量。
 
-### SOCKS proxy
+界面使用原生菜单、窗口和编辑表单，已移除分组、配置侧边栏及旧自定义弹窗。
 
-Set a port mapping's type to **SOCKS** for a dynamic proxy (`ssh -D`). Point your browser, system proxy, or a tool at `127.0.0.1:<port>`. When the tunnel is connected, the detail view's **Usage** section has the address and `socks5h://` / `socks5://` URLs ready to copy.
+## 稳定连接
 
-Use `socks5h://` when DNS should be resolved **on the server** — e.g. to reach internal hostnames behind it; `socks5://` resolves DNS locally:
+- 网络路径变化或唤醒后，等待网络稳定再重连；睡眠时暂停连接。
+- 每条隧道串行管理进程，旧 SSH 进程组及跳板机子进程退出并回收后，才启动新连接，避免网络切换后旧进程继续占用端口。
+- 停止先发送 SIGTERM，500 毫秒后仍未退出则发送 SIGKILL。关闭或删除隧道会同时取消待执行的重试。
+- 重试间隔依次为 1、2、4、8、15 秒；SSH 心跳间隔 10 秒，连续 3 次无响应判定失联，连接超时为 10 秒。
+- 强制独立前台连接和 `ExitOnForwardFailure=yes`，由应用统一管理心跳、超时与进程生命周期。
+- 端口被其他程序占用时显示错误并重试，不按端口号杀死其他程序。
+- 多个应用副本共享单实例锁；崩溃恢复会核对 PID、启动时间、可执行文件和进程组后再清理遗留进程。
 
-```bash
-curl -x socks5h://127.0.0.1:1080 http://internal-host:8080
+「已连接」表示 SSH 已进入转发会话，且显式远程转发得到确认，不代表目标服务本身一定健康。
+
+## 配置与升级
+
+配置文件：
+
+```text
+~/Library/Application Support/SSHTunnelManager/tunnels.json
 ```
 
-### Jump host (bastion)
+旧版平铺或分组配置会转换为完整 SSH 命令，保留名称、ID、转发参数和自动连接设置，跳过旧分隔项。首次写入前，原配置会备份到同目录的 `tunnels.before-command-ui.json`。无法读取或解析配置时会报告错误，不会用空列表覆盖原文件。
 
-When a host has no public route and is only reachable through a bastion, set the target as the **Host** and the bastion as the **Jump Host** (in the tunnel's *Advanced* section). The app adds `ssh -J`, so the login is routed through the bastion while the forward still targets the final host — the jump host is only a login path, not part of the data flow.
+旧版未保存的临时开启状态需要手动重新开启一次。当前版本会持久化开关状态。已安装应用与 Vibe Page 副本共享同一份用户配置。
 
-Example — reach a Postgres box `db.internal` that only the bastion can see:
+## 构建与运行
 
-- **Host**: `db.internal`  **Jump Host**: `you@bastion.example.com`
-- **Local Forward**: Local `127.0.0.1:5432` → Remote `127.0.0.1:5432`
+需要 **macOS 14+、Xcode 16+（Swift 6）**。
 
-Then point your client at `localhost:5432`. Chain multiple hops with commas: `you@bastion,you@inner-gateway`.
+```sh
+git clone https://github.com/OYMiss/ssh-tunnel-manager.git
+cd ssh-tunnel-manager
 
-### Remote forward (expose a local service)
+xcodebuild -project SSHTunnelManager/SSHTunnelManager.xcodeproj \
+  -scheme SSHTunnelManager -configuration Release \
+  -derivedDataPath build CODE_SIGNING_ALLOWED=NO
 
-A **Remote Forward** (`ssh -R`) is the reverse of a local forward: the server listens on a port and sends connections back to your Mac — handy for showing a local site to the outside world through a public server, catching a webhook, or reverse SSH. As with the other types, **Local** is always this Mac and **Remote** is the server.
+codesign --force --deep --sign - build/Build/Products/Release/SSHTunnelManager.app
+open build/Build/Products/Release/SSHTunnelManager.app
+```
 
-Example — make a local site (`localhost:3000`) reachable at the server's public address:
+构建产物位于 `build/Build/Products/Release/SSHTunnelManager.app`。上面的命令使用本机 ad-hoc 签名。仓库的发布工作流在推送 `v*` 标签时构建、签名并打包 DMG。
 
-- **Host**: your public server
-- **Remote Forward**: Local `127.0.0.1:3000` → Remote `0.0.0.0:8080`
+## 测试
 
-Now `http://your-server:8080` reaches your Mac's `localhost:3000`. Binding to `0.0.0.0` (rather than the server's own loopback) needs **`GatewayPorts yes`** in the server's `sshd_config`; without it the port is reachable only from the server itself.
+```sh
+swift test
+```
 
-### Connection alerts
+测试覆盖三种配置方式、表单与命令转换、参数保留、旧配置迁移、快速开关、网络变化、睡眠唤醒、进程组清理、端口冲突和并行隧道。集成测试使用临时密钥、隔离的本地 sshd 和 HTTP 服务验证实际转发，不连接生产服务器，也不改变 Wi-Fi/VPN 设置。
 
-The app can play a sound and/or show a notification when a tunnel connects or drops unexpectedly. Toggle them in **Preferences** (the gear in the sidebar footer) — sounds are on by default, notifications off. Manual disconnects and config edits stay silent; only genuine drops alert.
+可选的现有配置兼容性检查：
 
-Notifications need macOS permission. Turning **Show Notifications** on prompts for it the first time. If notifications still don't appear, open **System Settings → Notifications → SSH Tunnel Manager** and make sure **Allow Notifications** is on — for an unsigned build you may have to enable it there by hand.
+```sh
+SSHTUNNEL_CONFIG_CHECK="$HOME/Library/Application Support/SSHTunnelManager/tunnels.json" swift test
+```
 
-### When a tunnel won't connect
-
-A failed or dropped tunnel shows the reason in the menu bar and in its detail view — authentication failed, connection refused, host unreachable, DNS, a changed host key, or a local port already in use — so you know whether to check your key, the server, or your network. The reason sticks until the tunnel reconnects or you stop it. Tunnels that are simply switched off stay grey; red means a real problem.
-
-Two tunnels can't share a local forward port. The settings flag the clash as you type the port, and at connect time the second tunnel reports the port is in use instead of fighting the first — then connects on its own once the port frees.
-
-### Connection options
-
-Each tunnel's detail view exposes a few SSH options for awkward hosts:
-
-- **Connect Timeout / Alive Interval / Alive Count** — how long to wait for the connection, and how aggressively to probe a quiet one before declaring it dead.
-- **Compression** (`-C`) — trade CPU for bandwidth on slow links.
-- **Survive brief network drops** — keep the tunnel up through short outages (`TCPKeepAlive=no`), relying on the keepalive probes above instead of TCP-level teardown.
-- **Skip host key check** — for hosts recreated on the same address. Insecure (disables host-key verification); off by default.
-- **Jump Host** (`-J`) — route the login through one or more bastions to reach the host. See [Jump host (bastion)](#jump-host-bastion) above.
+该检查复制配置到临时目录后验证，不改写原文件；未设置环境变量时会跳过这一项。
 
 ## License
 

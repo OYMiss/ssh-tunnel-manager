@@ -22,3 +22,7 @@ dist/
 
 # JetBrains
 .idea/
+
+# Swift Package tests and packaged app
+.build/
+SSHTunnelManager.app/

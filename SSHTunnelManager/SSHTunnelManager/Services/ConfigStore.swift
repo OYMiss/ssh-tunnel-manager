@@ -1,52 +1,55 @@
 import Foundation
-import os
 
-private let logger = Logger(
-    subsystem: Bundle.main.bundleIdentifier ?? "SSHTunnelManager",
-    category: "ConfigStore"
-)
+@MainActor
+final class ConfigStore {
+    static var defaultDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SSHTunnelManager", isDirectory: true)
+    }
+    let directory: URL
+    var fileURL: URL { directory.appendingPathComponent("tunnels.json") }
 
-actor ConfigStore {
-    private let fileURL: URL
+    init(directory: URL = ConfigStore.defaultDirectory) { self.directory = directory }
 
-    init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appFolder = appSupport.appendingPathComponent("SSHTunnelManager", isDirectory: true)
-
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: appFolder, withIntermediateDirectories: true)
-
-        self.fileURL = appFolder.appendingPathComponent("tunnels.json")
+    func load() throws -> [Tunnel] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        let data = try Data(contentsOf: fileURL)
+        let tunnels: [Tunnel]
+        if let flat = try? JSONDecoder().decode([Tunnel].self, from: data) {
+            tunnels = flat
+        } else {
+            tunnels = try JSONDecoder().decode([LegacyItem].self, from: data).compactMap(\.tunnel)
+        }
+        guard Set(tunnels.map(\.id)).count == tunnels.count else {
+            throw CommandError("配置中存在重复 ID；为避免覆盖数据，已停止加载。")
+        }
+        // Keep the exact original bytes before the first edit in the new format.
+        let backup = directory.appendingPathComponent("tunnels.before-command-ui.json")
+        if !FileManager.default.fileExists(atPath: backup.path) {
+            try data.write(to: backup, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+        }
+        return tunnels
     }
 
-    func load() -> [SidebarItem] {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return []
-        }
-
-        do {
-            let data = try Data(contentsOf: fileURL)
-            // Current format: an array of sidebar items (tunnels + dividers).
-            if let items = try? JSONDecoder().decode([SidebarItem].self, from: data) {
-                return items
-            }
-            // Legacy format: a bare array of tunnels — wrap each as an item.
-            let tunnels = try JSONDecoder().decode([Tunnel].self, from: data)
-            return tunnels.map { .tunnel($0) }
-        } catch {
-            logger.error("Failed to load tunnels: \(error.localizedDescription, privacy: .public)")
-            return []
-        }
+    func save(_ tunnels: [Tunnel]) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(tunnels).write(to: fileURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
+}
 
-    func save(_ items: [SidebarItem]) {
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(items)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            logger.error("Failed to save tunnels: \(error.localizedDescription, privacy: .public)")
+private struct LegacyItem: Decodable {
+    let tunnel: Tunnel?
+    private enum CodingKeys: String, CodingKey { case kind, tunnel }
+    private enum Kind: String, Decodable { case tunnel, divider }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(Kind.self, forKey: .kind) {
+        case .tunnel: tunnel = try c.decode(Tunnel.self, forKey: .tunnel)
+        case .divider: tunnel = nil
         }
     }
 }

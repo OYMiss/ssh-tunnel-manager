@@ -1,122 +1,95 @@
 import SwiftUI
 import Darwin
-import UserNotifications
 
 @main
 struct SSHTunnelManagerApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
-        // Menu Bar
-        MenuBarExtra {
-            MenuBarView()
-                .environment(appDelegate.tunnelManager)
-        } label: {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
+        MenuBarExtra("SSH Tunnel Manager", systemImage: "network") {
+            MenuBarView().environment(delegate.manager)
         }
-        .menuBarExtraStyle(.window)
-
-        // Main Settings Window
+        .menuBarExtraStyle(.menu)
         Window("SSH Tunnel Manager", id: "main") {
-            ContentView()
-                .environment(appDelegate.tunnelManager)
-                .frame(minWidth: 600, minHeight: 400)
+            ContentView().environment(delegate.manager)
         }
-        .windowStyle(.automatic)
-        .windowResizability(.contentSize)
-        .defaultSize(width: 800, height: 600)
-        .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("New Tunnel") {
-                    appDelegate.tunnelManager.addTunnel()
-                }
-                .keyboardShortcut("n", modifiers: .command)
-            }
-        }
+        .defaultSize(width: 760, height: 480)
+        .windowResizability(.automatic)
     }
 }
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
-    let tunnelManager = TunnelManager()
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let manager = TunnelManager()
+    private var monitor: NetworkMonitor?
+    private var startup: Task<Void, Never>?
+    private var signals: [DispatchSourceSignal] = []
+    private var terminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Make app accessory - no dock icon, proper focus handling
         NSApp.setActivationPolicy(.accessory)
-        // Disable Sudden Termination - ensures cleanup handlers run
         ProcessInfo.processInfo.disableSuddenTermination()
-
-        // Deliver connect/disconnect notifications as banners even while the app
-        // is the active app (otherwise the system suppresses foreground alerts).
-        UNUserNotificationCenter.current().delegate = self
-
-        // Register for additional termination signals
-        setupSignalHandlers()
-
-        // Register for workspace notifications (logout, shutdown, restart)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(workspaceWillPowerOff),
-            name: NSWorkspace.willPowerOffNotification,
-            object: nil
-        )
-
-        // Observe window closing to return focus to previous app
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleWindowClose),
-            name: NSWindow.willCloseNotification,
-            object: nil
-        )
-    }
-
-    @objc private func handleWindowClose(_ notification: Notification) {
-        // When Settings window closes, hide app to return focus to previous app
-        // Small delay to ensure window is fully closed
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            // Only hide if no windows are visible
-            if NSApp.windows.filter({ $0.isVisible && $0.className != "NSStatusBarWindow" }).isEmpty {
-                NSApp.hide(nil)
+        manager.networkChanged(available: false)
+        startup = Task { [self] in
+            do {
+                try await manager.start()
+                let monitor = NetworkMonitor { [weak self] in self?.manager.networkChanged(available: $0) }
+                self.monitor = monitor
+                monitor.start()
+            } catch is InstanceAlreadyRunning {
+                // All copies, including Vibe Page, share one lock. Opening a
+                // second copy activates the existing app without touching SSH.
+                NSWorkspace.shared.runningApplications.first {
+                    $0.bundleIdentifier == Bundle.main.bundleIdentifier && $0.processIdentifier != getpid()
+                }?.activate(options: [])
+                // AppKit can enter a nested termination loop. Let this startup
+                // task return BEFORE the termination delegate awaits it.
+                requestAppTermination()
+            } catch is CancellationError {
+                // Shutdown owns the rest of cleanup.
+            } catch {
+                manager.errorMessage = "配置加载失败，原文件未改动：\(error.localizedDescription)"
             }
+        }
+        let notifications = NSWorkspace.shared.notificationCenter
+        notifications.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        notifications.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        notifications.addObserver(self, selector: #selector(willPowerOff), name: NSWorkspace.willPowerOffNotification, object: nil)
+        for number in [SIGTERM, SIGINT, SIGHUP] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { DispatchQueue.main.async { requestAppTermination() } }
+            source.resume()
+            signals.append(source)
         }
     }
 
-    @objc private func workspaceWillPowerOff(_ notification: Notification) {
-        tunnelManager.disconnectAll()
+    @objc private func willSleep() { manager.setSleeping(true) }
+    @objc private func didWake() {
+        manager.networkChanged(available: false)
+        manager.setSleeping(false)
+        monitor?.refresh()
     }
-
-    private func setupSignalHandlers() {
-        // Handle common termination signals
-        let signals: [Int32] = [SIGTERM, SIGINT, SIGHUP]
-
-        for sig in signals {
-            signal(sig) { _ in
-                // Signal handlers must be synchronous and non-blocking
-                // Use the sync version that reads PIDs from file
-                if let delegate = NSApplication.shared.delegate as? AppDelegate {
-                    delegate.tunnelManager.disconnectAllSync()
-                }
-                exit(0)
-            }
-        }
-    }
-
-    // Show notifications as banners even when this app is frontmost.
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .list])
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        tunnelManager.disconnectAll()
-    }
+    @objc private func willPowerOff() { requestAppTermination() }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Cleanup before termination is confirmed
-        tunnelManager.disconnectAll()
-        return .terminateNow
+        if !terminating {
+            terminating = true
+            monitor?.stop()
+            startup?.cancel()
+            Task {
+                await startup?.value
+                await manager.shutdown()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
     }
+}
+
+/// terminateLater enters an AppKit modal loop. Start termination from a run-loop
+/// timer, not a Swift task or main-dispatch block: those would hold the executor
+/// that the async cleanup needs to finish and reply to AppKit.
+@MainActor
+func requestAppTermination() {
+    NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
 }

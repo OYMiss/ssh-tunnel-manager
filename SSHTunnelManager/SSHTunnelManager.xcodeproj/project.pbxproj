@@ -17,6 +17,10 @@
 		A10008 /* TunnelDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10008; };
 		A10009 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10009; };
 		A10010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10010; };
+		A10012 /* SSHCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012; };
+		A10013 /* SSHProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
+		A10014 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10014; };
+		A10015 /* TunnelSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10015; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +36,10 @@
 		B10010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B10011 /* SSHTunnelManager.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SSHTunnelManager.entitlements; sourceTree = "<group>"; };
 		C10001 /* SSHTunnelManager.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SSHTunnelManager.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10012 /* SSHCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHCommand.swift; sourceTree = "<group>"; };
+		B10013 /* SSHProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHProcess.swift; sourceTree = "<group>"; };
+		B10014 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
+		B10015 /* TunnelSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelSetup.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -79,6 +87,8 @@
 			isa = PBXGroup;
 			children = (
 				B10002 /* Tunnel.swift */,
+				B10012 /* SSHCommand.swift */,
+				B10015 /* TunnelSetup.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -88,6 +98,8 @@
 			children = (
 				B10003 /* ConfigStore.swift */,
 				B10004 /* TunnelManager.swift */,
+				B10014 /* NetworkMonitor.swift */,
+				B10013 /* SSHProcess.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -208,6 +220,10 @@
 				A10002 /* Tunnel.swift in Sources */,
 				A10003 /* ConfigStore.swift in Sources */,
 				A10004 /* TunnelManager.swift in Sources */,
+				A10014 /* NetworkMonitor.swift in Sources */,
+				A10013 /* SSHProcess.swift in Sources */,
+				A10012 /* SSHCommand.swift in Sources */,
+				A10015 /* TunnelSetup.swift in Sources */,
 				A10005 /* StatusIndicator.swift in Sources */,
 				A10006 /* MenuBarView.swift in Sources */,
 				A10007 /* TunnelListView.swift in Sources */,
@@ -343,7 +359,7 @@
 				CODE_SIGN_ENTITLEMENTS = SSHTunnelManager/SSHTunnelManager.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_ASSET_PATHS = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -354,12 +370,12 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.SSHTunnelManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_STRICT_CONCURRENCY = complete;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
@@ -371,7 +387,7 @@
 				CODE_SIGN_ENTITLEMENTS = SSHTunnelManager/SSHTunnelManager.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_ASSET_PATHS = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -382,12 +398,12 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.SSHTunnelManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_STRICT_CONCURRENCY = complete;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};

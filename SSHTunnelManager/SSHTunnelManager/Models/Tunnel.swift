@@ -1,343 +1,97 @@
 import Foundation
 
-/// How a port mapping forwards traffic.
-enum ForwardType: String, Codable, Hashable {
-    case local      // ssh -L : a fixed local→remote port forward
-    case remote     // ssh -R : a fixed remote→local port forward (the remote
-                    // host binds the port; traffic arriving there is sent
-                    // back to this Mac)
-    case dynamic    // ssh -D : a SOCKS proxy (destinations chosen per request)
-}
-
-struct PortMapping: Identifiable, Codable, Hashable {
+/// The command is the only source of connection configuration. `enabled` also
+/// remembers the user's intent across app launches; a network outage doesn't
+/// turn that intent off.
+struct Tunnel: Identifiable, Codable, Equatable, Sendable {
     var id: UUID
-    var forward: ForwardType
-    var localHost: String
-    var localPort: Int
-    var remoteHost: String
-    var remotePort: Int
+    var name: String
+    var command: String
+    var enabled: Bool
 
-    init(
-        id: UUID = UUID(),
-        forward: ForwardType = .local,
-        localHost: String = "127.0.0.1",
-        localPort: Int = 8080,
-        remoteHost: String = "127.0.0.1",
-        remotePort: Int = 8080
-    ) {
+    init(id: UUID = UUID(), name: String = "", command: String, enabled: Bool = false) {
         self.id = id
-        self.forward = forward
-        self.localHost = localHost
-        self.localPort = localPort
-        self.remoteHost = remoteHost
-        self.remotePort = remotePort
+        self.name = name
+        self.command = command
+        self.enabled = enabled
     }
 
-    enum CodingKeys: String, CodingKey {
-        case id, forward, localHost, localPort, remoteHost, remotePort
+    var parsed: SSHCommand? { try? SSHCommand(command) }
+    var displayName: String { name.isEmpty ? (parsed?.destination ?? "SSH 隧道") : name }
+    var portSummary: String { parsed?.portSummary ?? "命令需要检查" }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, command, enabled
+        case host, port, identityFile, autoConnect, portMappings
+        case localHost, localPort, remoteHost, remotePort
+        case compression, disableTCPKeepAlive, skipHostKeyCheck, extraSSHArguments, proxyJump
+        case connectTimeout, serverAliveInterval, serverAliveCountMax
     }
 
-    // Custom decoder so older configs without `forward` default to .local.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
-        forward = try c.decodeIfPresent(ForwardType.self, forKey: .forward) ?? .local
-        localHost = try c.decode(String.self, forKey: .localHost)
-        localPort = try c.decode(Int.self, forKey: .localPort)
-        remoteHost = try c.decode(String.self, forKey: .remoteHost)
-        remotePort = try c.decode(Int.self, forKey: .remotePort)
-    }
-}
-
-struct Tunnel: Identifiable, Codable, Hashable {
-    static let defaultSSHPort = 22
-    /// Normalizes the GUI's default SSH port to nil so the port field can stay
-    /// blank while connection equivalence still treats nil and 22 the same.
-    static func normalizedSSHPort(_ port: Int?) -> Int? {
-        port == defaultSSHPort ? nil : port
-    }
-
-    var id: UUID
-    var name: String
-    var host: String           // user@server.com or SSH config alias
-    var port: Int?             // SSH port; nil or 22 means the default 22
-    var portMappings: [PortMapping]
-    var identityFile: String?  // Path to identity file (~/.ssh/id_rsa)
-    var autoConnect: Bool      // Connect on app launch
-
-    // Connection hardening options. nil means "use the app's default",
-    // so existing configs without these keys behave exactly as before.
-    var connectTimeout: Int?         // -o ConnectTimeout=N (seconds)
-    var serverAliveInterval: Int?    // -o ServerAliveInterval=N (seconds)
-    var serverAliveCountMax: Int?    // -o ServerAliveCountMax=N
-
-    // Simple on/off connection options. Unlike the Int? options above these
-    // have an unambiguous "off" state, so a plain Bool (defaulting to false)
-    // is enough — no separate "use app default" case to represent.
-    var compression: Bool          // -C (compress the data stream)
-    var disableTCPKeepAlive: Bool  // -o TCPKeepAlive=no — keep the tunnel up through brief
-                                   // outages; rely on the ServerAlive probes above instead of
-                                   // TCP-level dead-path teardown. (ssh defaults to yes.)
-    var skipHostKeyCheck: Bool     // -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null —
-                                   // insecure: skips host-key verification, for hosts recreated
-                                   // on the same address.
-    var extraSSHArguments: String? // Advanced ssh flags not modeled by the GUI.
-
-    // -J host[:port][,host2[:port2]...] — hop through one or more
-    // intermediate hosts to reach `host`, replacing a manual multi-hop ssh.
-    // nil/empty means "connect directly", matching today's behavior.
-    var proxyJump: String?
-
-    /// Fallback used when a tunnel doesn't override `serverAliveInterval`.
-    static let defaultServerAliveInterval = 30
-    /// Fallback used when a tunnel doesn't override `serverAliveCountMax`.
-    static let defaultServerAliveCountMax = 3
-
-    init(
-        id: UUID = UUID(),
-        name: String = "",
-        host: String = "",
-        port: Int? = nil,
-        portMappings: [PortMapping] = [PortMapping()],
-        identityFile: String? = nil,
-        autoConnect: Bool = false,
-        connectTimeout: Int? = nil,
-        serverAliveInterval: Int? = nil,
-        serverAliveCountMax: Int? = nil,
-        compression: Bool = false,
-        disableTCPKeepAlive: Bool = false,
-        skipHostKeyCheck: Bool = false,
-        extraSSHArguments: String? = nil,
-        proxyJump: String? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.host = host
-        self.port = port
-        self.portMappings = portMappings.isEmpty ? [PortMapping()] : portMappings
-        self.identityFile = identityFile
-        self.autoConnect = autoConnect
-        self.connectTimeout = connectTimeout
-        self.serverAliveInterval = serverAliveInterval
-        self.serverAliveCountMax = serverAliveCountMax
-        self.compression = compression
-        self.disableTCPKeepAlive = disableTCPKeepAlive
-        self.skipHostKeyCheck = skipHostKeyCheck
-        self.extraSSHArguments = extraSSHArguments
-        self.proxyJump = proxyJump
-    }
-
-    /// True when `other` would produce the same `ssh` invocation as `self`.
-    /// Name and autoConnect are not included in connection equivalence; port
-    /// is compared after normalizing the default 22 to nil.
-    func hasSameConnection(as other: Tunnel) -> Bool {
-        host == other.host &&
-        Self.normalizedSSHPort(port) == Self.normalizedSSHPort(other.port) &&
-        portMappings == other.portMappings &&
-        identityFile == other.identityFile &&
-        connectTimeout == other.connectTimeout &&
-        serverAliveInterval == other.serverAliveInterval &&
-        serverAliveCountMax == other.serverAliveCountMax &&
-        compression == other.compression &&
-        disableTCPKeepAlive == other.disableTCPKeepAlive &&
-        skipHostKeyCheck == other.skipHostKeyCheck &&
-        extraSSHArguments == other.extraSSHArguments &&
-        proxyJump == other.proxyJump
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case id, name, host, port, portMappings, identityFile, autoConnect
-        case connectTimeout, serverAliveInterval, serverAliveCountMax
-        case compression, disableTCPKeepAlive, skipHostKeyCheck, extraSSHArguments, proxyJump
-        // Legacy single-mapping fields
-        case localHost, localPort, remoteHost, remotePort
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(UUID.self, forKey: .id)
-        name = try container.decode(String.self, forKey: .name)
-        host = try container.decode(String.self, forKey: .host)
-        port = try container.decodeIfPresent(Int.self, forKey: .port)
-        identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
-        autoConnect = try container.decode(Bool.self, forKey: .autoConnect)
-        // Absent in older configs — nil keeps the previous hardcoded behavior.
-        connectTimeout = try container.decodeIfPresent(Int.self, forKey: .connectTimeout)
-        serverAliveInterval = try container.decodeIfPresent(Int.self, forKey: .serverAliveInterval)
-        serverAliveCountMax = try container.decodeIfPresent(Int.self, forKey: .serverAliveCountMax)
-        // Absent in older configs — false matches today's behavior (neither
-        // flag is currently passed to ssh at all).
-        compression = try container.decodeIfPresent(Bool.self, forKey: .compression) ?? false
-        disableTCPKeepAlive = try container.decodeIfPresent(Bool.self, forKey: .disableTCPKeepAlive) ?? false
-        skipHostKeyCheck = try container.decodeIfPresent(Bool.self, forKey: .skipHostKeyCheck) ?? false
-        extraSSHArguments = try container.decodeIfPresent(String.self, forKey: .extraSSHArguments)
-        // Absent in older configs — nil means "connect directly", i.e. no -J.
-        proxyJump = try container.decodeIfPresent(String.self, forKey: .proxyJump)
-
-        if let mappings = try container.decodeIfPresent([PortMapping].self, forKey: .portMappings),
-           !mappings.isEmpty {
-            portMappings = mappings
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        if let command = try c.decodeIfPresent(String.self, forKey: .command) {
+            self.command = command
+            enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+            return
+        }
+        // One-time, lossless conversion from the former configuration forms.
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .autoConnect) ?? false
+        var args = ["ssh", "-N"]
+        if let port = try c.decodeIfPresent(Int.self, forKey: .port) { args += ["-p", String(port)] }
+        if let key = try c.decodeIfPresent(String.self, forKey: .identityFile), !key.isEmpty {
+            args += ["-i", SSHCommand.quote(key), "-o", "IdentitiesOnly=yes"]
+        }
+        if let jump = try c.decodeIfPresent(String.self, forKey: .proxyJump), !jump.isEmpty {
+            args += ["-J", SSHCommand.quote(jump)]
+        }
+        for (key, option) in [(CodingKeys.connectTimeout, "ConnectTimeout"), (.serverAliveInterval, "ServerAliveInterval"), (.serverAliveCountMax, "ServerAliveCountMax")] {
+            if let value = try c.decodeIfPresent(Int.self, forKey: key) { args += ["-o", "\(option)=\(value)"] }
+        }
+        if try c.decodeIfPresent(Bool.self, forKey: .compression) == true { args += ["-C"] }
+        if try c.decodeIfPresent(Bool.self, forKey: .disableTCPKeepAlive) == true { args += ["-o", "TCPKeepAlive=no"] }
+        if try c.decodeIfPresent(Bool.self, forKey: .skipHostKeyCheck) == true {
+            args += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+        }
+        struct Mapping: Decodable {
+            var forward: String?
+            var localHost: String
+            var localPort: Int
+            var remoteHost: String
+            var remotePort: Int
+        }
+        let mappings: [Mapping]
+        if let values = try c.decodeIfPresent([Mapping].self, forKey: .portMappings), !values.isEmpty {
+            mappings = values
         } else {
-            // Migrate old configs with a single port mapping
-            let localHost = try container.decode(String.self, forKey: .localHost)
-            let localPort = try container.decode(Int.self, forKey: .localPort)
-            let remoteHost = try container.decode(String.self, forKey: .remoteHost)
-            let remotePort = try container.decode(Int.self, forKey: .remotePort)
-            portMappings = [PortMapping(
-                localHost: localHost,
-                localPort: localPort,
-                remoteHost: remoteHost,
-                remotePort: remotePort
+            mappings = [Mapping(
+                localHost: try c.decode(String.self, forKey: .localHost),
+                localPort: try c.decode(Int.self, forKey: .localPort),
+                remoteHost: try c.decode(String.self, forKey: .remoteHost),
+                remotePort: try c.decode(Int.self, forKey: .remotePort)
             )]
         }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(name, forKey: .name)
-        try container.encode(host, forKey: .host)
-        try container.encodeIfPresent(port, forKey: .port)
-        try container.encode(portMappings, forKey: .portMappings)
-        try container.encodeIfPresent(identityFile, forKey: .identityFile)
-        try container.encode(autoConnect, forKey: .autoConnect)
-        try container.encodeIfPresent(connectTimeout, forKey: .connectTimeout)
-        try container.encodeIfPresent(serverAliveInterval, forKey: .serverAliveInterval)
-        try container.encodeIfPresent(serverAliveCountMax, forKey: .serverAliveCountMax)
-        try container.encode(compression, forKey: .compression)
-        try container.encode(disableTCPKeepAlive, forKey: .disableTCPKeepAlive)
-        try container.encode(skipHostKeyCheck, forKey: .skipHostKeyCheck)
-        try container.encodeIfPresent(extraSSHArguments, forKey: .extraSSHArguments)
-        try container.encodeIfPresent(proxyJump, forKey: .proxyJump)
-    }
-
-    var mappingsSummary: String {
-        portMappings.map { m in
-            switch m.forward {
-            case .dynamic: return "SOCKS :\(m.localPort)"
-            case .remote: return "R :\(m.remotePort) → :\(m.localPort)"
-            case .local: return ":\(m.localPort) → :\(m.remotePort)"
+        func address(_ host: String) -> String { host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host }
+        for m in mappings {
+            switch m.forward ?? "local" {
+            case "dynamic": args += ["-D", SSHCommand.quote("\(address(m.localHost)):\(m.localPort)")]
+            case "remote": args += ["-R", SSHCommand.quote("\(address(m.remoteHost)):\(m.remotePort):\(address(m.localHost)):\(m.localPort)")]
+            case "local": args += ["-L", SSHCommand.quote("\(address(m.localHost)):\(m.localPort):\(address(m.remoteHost)):\(m.remotePort)")]
+            default: throw CommandError("旧配置包含无法识别的转发类型，原文件未被覆盖。")
             }
-        }.joined(separator: ", ")
-    }
-
-    var localPortsSummary: String {
-        portMappings.map { ":\($0.localPort)" }.joined(separator: ", ")
-    }
-
-    /// Ports this tunnel binds on *this* Mac. Local forwards (-L) and SOCKS
-    /// proxies (-D) listen locally; a remote forward (-R) binds on the server,
-    /// so its `localPort` is a remote port and must be excluded from any
-    /// local-port check (conflict detection, the "already in use" pre-flight,
-    /// the establish probe).
-    var locallyBoundPorts: [Int] {
-        portMappings.filter { $0.forward != .remote }.map(\.localPort)
-    }
-}
-
-
-/// A standalone divider that begins a group; carries an optional name and is
-/// reordered independently of tunnels.
-struct GroupDivider: Identifiable, Codable, Hashable {
-    var id: UUID
-    var title: String
-
-    init(id: UUID = UUID(), title: String = "") {
-        self.id = id
-        self.title = title
-    }
-}
-
-/// One entry in the sidebar/menu ordering: a tunnel or a group divider.
-enum SidebarItem: Identifiable, Hashable {
-    case tunnel(Tunnel)
-    case divider(GroupDivider)
-
-    var id: UUID {
-        switch self {
-        case .tunnel(let t): return t.id
-        case .divider(let d): return d.id
         }
-    }
-
-    var tunnel: Tunnel? {
-        if case .tunnel(let t) = self { return t }
-        return nil
-    }
-
-    var divider: GroupDivider? {
-        if case .divider(let d) = self { return d }
-        return nil
-    }
-
-    var displayName: String {
-        switch self {
-        case .tunnel(let tunnel): return tunnel.name.isEmpty ? "tunnel" : tunnel.name
-        case .divider(let divider): return divider.title.isEmpty ? "group divider" : divider.title
-        }
-    }
-}
-
-extension SidebarItem: Codable {
-    private enum Kind: String, Codable { case tunnel, divider }
-    private enum CodingKeys: String, CodingKey { case kind, tunnel, divider }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        switch try c.decode(Kind.self, forKey: .kind) {
-        case .tunnel: self = .tunnel(try c.decode(Tunnel.self, forKey: .tunnel))
-        case .divider: self = .divider(try c.decode(GroupDivider.self, forKey: .divider))
-        }
+        if let extra = try c.decodeIfPresent(String.self, forKey: .extraSSHArguments), !extra.isEmpty { args += [extra] }
+        args += [SSHCommand.quote(try c.decode(String.self, forKey: .host))]
+        command = args.joined(separator: " ")
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        switch self {
-        case .tunnel(let t):
-            try c.encode(Kind.tunnel, forKey: .kind)
-            try c.encode(t, forKey: .tunnel)
-        case .divider(let d):
-            try c.encode(Kind.divider, forKey: .kind)
-            try c.encode(d, forKey: .divider)
-        }
-    }
-}
-
-/// A contiguous run of tunnels between dividers.
-/// `title` is nil for the leading run before the first divider.
-struct TunnelGroup: Identifiable {
-    let id: String
-    let title: String?
-    let tunnels: [Tunnel]
-}
-
-extension Array where Element == SidebarItem {
-    /// All tunnels in order, ignoring dividers.
-    var tunnels: [Tunnel] { compactMap(\.tunnel) }
-
-    /// Split into groups: each divider begins a new group with its title;
-    /// tunnels before the first divider form a leading group with a nil title.
-    func grouped() -> [TunnelGroup] {
-        var groups: [TunnelGroup] = []
-        var currentTunnels: [Tunnel] = []
-        var currentTitle: String?
-
-        func flush() {
-            guard let first = currentTunnels.first else { return }
-            groups.append(TunnelGroup(id: first.id.uuidString, title: currentTitle, tunnels: currentTunnels))
-        }
-
-        for item in self {
-            switch item {
-            case .tunnel(let t):
-                currentTunnels.append(t)
-            case .divider(let d):
-                flush()
-                currentTunnels = []
-                currentTitle = d.title
-            }
-        }
-        flush()
-        return groups
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(command, forKey: .command)
+        try c.encode(enabled, forKey: .enabled)
     }
 }

@@ -1,897 +1,239 @@
 import Foundation
-import SwiftUI
-import Darwin
-import AppKit
-import UserNotifications
-import os
+import Observation
 
-private let logger = Logger(
-    subsystem: Bundle.main.bundleIdentifier ?? "SSHTunnelManager",
-    category: "TunnelManager"
-)
-
-/// Plays the connect/disconnect feedback sounds, gated by a user preference.
-/// Stored as a plain UserDefaults-backed flag (rather than @AppStorage) so it
-/// can be read from this non-View class.
-enum TunnelSound {
-    static let soundsEnabledKey = "tunnelSoundsEnabled"
-
-    static var isEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: soundsEnabledKey) as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: soundsEnabledKey) }
-    }
-
-    @MainActor
-    static func playConnected() {
-        guard isEnabled else { return }
-        NSSound(named: "Pop")?.play()
-    }
-
-    @MainActor
-    static func playDisconnected() {
-        guard isEnabled else { return }
-        NSSound(named: "Basso")?.play()
-    }
+struct TunnelStatus: Equatable {
+    enum Phase { case stopped, connecting, connected, waiting, stopping }
+    var phase: Phase = .stopped
+    var message: String = "已停止"
 }
 
-/// Posts a user notification on connect/disconnect, gated by a user
-/// preference. Unlike TunnelSound, these identify *which* tunnel changed
-/// state, since a sound alone can't carry that information.
-enum TunnelNotification {
-    static let notificationsEnabledKey = "tunnelNotificationsEnabled"
-
-    static var isEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: notificationsEnabledKey) as? Bool ?? false }
-        set { UserDefaults.standard.set(newValue, forKey: notificationsEnabledKey) }
+/// All state changes run on the main actor. Each tunnel has exactly one worker;
+/// cancelling that worker requests a restart, but its replacement is not created
+/// until stop() has reaped the old process group and drained its stderr.
+@Observable @MainActor
+final class TunnelManager {
+    typealias ProcessFactory = @MainActor (SSHCommand) throws -> any TunnelProcess
+    struct Timing {
+        var poll: Duration = .milliseconds(100)
+        var startupTimeout: TimeInterval = 45
+        var retry: [Duration] = [.seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15)]
     }
 
-    /// Requests notification permission once at launch. Safe to call
-    /// repeatedly — the system only prompts the first time.
-    static func requestAuthorizationIfNeeded() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
-            if let error {
-                logger.error("Notification authorization request failed: \(error.localizedDescription, privacy: .public)")
-            } else if !granted {
-                logger.info("Notification authorization was denied by the user")
-            }
-        }
+    private(set) var tunnels: [Tunnel] = []
+    private(set) var isLoaded = false
+    private(set) var statuses: [UUID: TunnelStatus] = [:]
+    var errorMessage: String?
+    private let store: ConfigStore
+    private let factory: ProcessFactory
+    private let timing: Timing
+    private let useRegistry: Bool
+    @ObservationIgnored private var registry: ProcessRegistry?
+    @ObservationIgnored private var workers: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var online = true
+    @ObservationIgnored private var sleeping = false
+    @ObservationIgnored private var shuttingDown = false
+
+    init(store: ConfigStore = ConfigStore(), useRegistry: Bool = true, timing: Timing = Timing(),
+         factory: @escaping ProcessFactory = { try SSHProcess(arguments: $0.arguments, remoteForwards: $0.remoteForwardCount) }) {
+        self.store = store
+        self.useRegistry = useRegistry
+        self.factory = factory
+        self.timing = timing
     }
 
-    static func notifyConnected(tunnelName: String) {
-        guard isEnabled else { return }
-        post(title: tunnelName, body: "Connected")
+    func start() async throws {
+        guard !isLoaded else { return }
+        if useRegistry {
+            let registry = try ProcessRegistry(directory: store.directory)
+            self.registry = registry
+            try await registry.recover()
+        }
+        try Task.checkCancellation()
+        tunnels = try store.load()
+        isLoaded = true
+        for tunnel in tunnels where tunnel.enabled { reconcile(tunnel.id) }
     }
 
-    static func notifyDisconnected(tunnelName: String) {
-        guard isEnabled else { return }
-        post(title: tunnelName, body: "Disconnected — attempting to reconnect")
-    }
+    func status(for tunnel: Tunnel) -> TunnelStatus { statuses[tunnel.id] ?? TunnelStatus() }
 
-    private static func post(title: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        // No content.sound here — TunnelSound is the separate, independently
-        // toggled mechanism for audio feedback. Stacking both would mean a
-        // sound plays twice if the user has both options enabled.
-
-        let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
-            content: content,
-            trigger: nil // deliver immediately
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                logger.error("Failed to deliver notification: \(error.localizedDescription, privacy: .public)")
-            }
-        }
-    }
-}
-
-
-/// File to store active PIDs for cleanup on crash/force quit
-private let pidFileURL: URL = {
-    let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-    let appFolder = appSupport.appendingPathComponent("SSHTunnelManager", isDirectory: true)
-    try? FileManager.default.createDirectory(at: appFolder, withIntermediateDirectories: true)
-    return appFolder.appendingPathComponent("active_pids.txt")
-}()
-
-/// Process group ID for all SSH child processes (accessed from signal handlers, so must be global).
-/// Left as a plain global rather than `nonisolated(unsafe)` so it compiles on Swift 5.9 /
-/// Xcode 15.2 (which the release CI pins). It is written once at startup and read from C-level
-/// signal/atexit handlers; under strict concurrency this is a benign warning, not an error.
-private var sshProcessGroupID: pid_t = 0
-
-/// Kill SSH processes for all local ports in a tunnel
-private func killSSHProcessesForTunnel(_ tunnel: Tunnel) {
-    for mapping in tunnel.portMappings {
-        findAndKillSSHProcesses(localPort: mapping.localPort)
-    }
-}
-
-/// Kill SSH processes using specified local port
-private func findAndKillSSHProcesses(localPort: Int) {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    task.arguments = ["-f", "ssh.*-[LD].*:\(localPort)[: ]"]
-    task.standardOutput = FileHandle.nullDevice
-    task.standardError = FileHandle.nullDevice
-    try? task.run()
-    task.waitUntilExit()
-}
-
-/// Whether something is accepting TCP connections on 127.0.0.1:port. ssh binds a
-/// forward's local port only once the connection actually succeeds, so this is
-/// used to detect when a tunnel is genuinely up.
-private func isLocalPortOpen(_ port: Int) -> Bool {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { return false }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = in_port_t(UInt16(truncatingIfNeeded: port)).bigEndian
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    let rc = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-            connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    return rc == 0
-}
-
-private func tokenizeSSHArguments(_ arguments: String) throws -> [String] {
-    var tokens: [String] = []
-    var current = ""
-    var quote: Character?
-    var escaping = false
-
-    for character in arguments {
-        if escaping {
-            current.append(character)
-            escaping = false
-            continue
-        }
-
-        if character == "\\" && quote != "'" {
-            escaping = true
-            continue
-        }
-
-        if let activeQuote = quote {
-            if character == activeQuote {
-                quote = nil
-            } else {
-                current.append(character)
-            }
-            continue
-        }
-
-        if character == "'" || character == "\"" {
-            quote = character
-            continue
-        }
-
-        if character.isWhitespace {
-            if !current.isEmpty {
-                tokens.append(current)
-                current = ""
-            }
+    @discardableResult
+    func save(command: String, replacing id: UUID? = nil) throws -> UUID {
+        let command = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try SSHCommand(command)
+        guard isLoaded, !shuttingDown else { throw CommandError("配置尚未加载。") }
+        var updated = tunnels
+        let tunnelID: UUID
+        if let id, let index = updated.firstIndex(where: { $0.id == id }) {
+            updated[index].command = command
+            tunnelID = id
         } else {
-            current.append(character)
+            let new = Tunnel(command: command)
+            updated.append(new)
+            tunnelID = new.id
+        }
+        try store.save(updated)
+        let old = tunnels.first { $0.id == tunnelID }
+        tunnels = updated
+        if old?.command != command { reconcile(tunnelID) }
+        return tunnelID
+    }
+
+    func setEnabled(_ enabled: Bool, for id: UUID) {
+        guard isLoaded, !shuttingDown, let index = tunnels.firstIndex(where: { $0.id == id }) else { return }
+        var updated = tunnels
+        updated[index].enabled = enabled
+        do {
+            try store.save(updated)
+            tunnels = updated
+            reconcile(id)
+        } catch { errorMessage = "无法保存配置：\(error.localizedDescription)" }
+    }
+
+    func delete(_ id: UUID) {
+        let updated = tunnels.filter { $0.id != id }
+        do {
+            try store.save(updated)
+            tunnels = updated
+            reconcile(id)
+        } catch { errorMessage = "无法保存配置：\(error.localizedDescription)" }
+    }
+
+    func networkChanged(available: Bool) {
+        online = available
+        for tunnel in tunnels where tunnel.enabled { reconcile(tunnel.id) }
+    }
+
+    func setSleeping(_ value: Bool) {
+        sleeping = value
+        for tunnel in tunnels where tunnel.enabled { reconcile(tunnel.id) }
+    }
+
+    private func wantsConnection(_ id: UUID) -> Bool {
+        !shuttingDown && online && !sleeping && tunnels.contains { $0.id == id && $0.enabled }
+    }
+
+    private func reconcile(_ id: UUID) {
+        if let task = workers[id] {
+            // Keep the slot until teardown completes. Multiple rapid changes
+            // only cancel this same worker, never create competing starts.
+            task.cancel()
+            statuses[id] = TunnelStatus(phase: .stopping, message: "正在释放端口…")
+        } else if wantsConnection(id) {
+            launchWorker(id)
+        } else {
+            setIdleStatus(id)
         }
     }
 
-    if escaping {
-        throw ExtraSSHArgumentsError.trailingEscape
-    }
-    if quote != nil {
-        throw ExtraSSHArgumentsError.unclosedQuote
-    }
-    if !current.isEmpty {
-        tokens.append(current)
-    }
-    return tokens
-}
-
-private enum ExtraSSHArgumentsError: LocalizedError {
-    case trailingEscape
-    case unclosedQuote
-
-    var errorDescription: String? {
-        switch self {
-        case .trailingEscape:
-            return "Extra SSH arguments end with an unfinished escape."
-        case .unclosedQuote:
-            return "Extra SSH arguments have an unclosed quote."
-        }
-    }
-}
-
-/// Kill processes by PIDs from file (cleanup from previous session)
-private func killOrphanedProcesses() {
-    guard FileManager.default.fileExists(atPath: pidFileURL.path) else { return }
-
-    if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
-        let pids = content.components(separatedBy: "\n").compactMap { Int32($0) }
-        for pid in pids {
-            kill(pid, SIGKILL)
-        }
-    }
-    try? FileManager.default.removeItem(at: pidFileURL)
-}
-
-/// Save active PIDs to file
-private func savePIDsToFile(_ pids: [Int32]) {
-    let content = pids.map { String($0) }.joined(separator: "\n")
-    try? content.write(to: pidFileURL, atomically: true, encoding: .utf8)
-}
-
-/// Remove PID file
-private func removePIDFile() {
-    try? FileManager.default.removeItem(at: pidFileURL)
-}
-
-/// Kill entire process group (all SSH children)
-private func killProcessGroup() {
-    if sshProcessGroupID != 0 {
-        // Kill entire process group with negative PID
-        kill(-sshProcessGroupID, SIGKILL)
-    }
-}
-
-@Observable
-@MainActor
-class TunnelManager {
-    var items: [SidebarItem] = []
-    var tunnels: [Tunnel] { items.tunnels }
-    private var processIDs: [UUID: Int32] = [:]
-    private var connectionStatus: [UUID: ConnectionStatus] = [:]
-    private var shouldBeConnected: Set<UUID> = [] // Tracks desired state for reconnection
-    private var connectingInFlight: Set<UUID> = [] // Tunnels whose SSH process is mid-startup
-    private var establishedTunnels: Set<UUID> = [] // Connections that survived the grace period (gates feedback)
-    private var lastErrors: [UUID: String] = [:] // Why each tunnel last failed/dropped — sticky until it establishes or is stopped
-    private let configStore = ConfigStore()
-    private var reconnectTask: Task<Void, Never>?
-
-    init() {
-        // Kill any orphaned processes from previous session
-        killOrphanedProcesses()
-
-        // Create a new process group for SSH processes
-        // Using our own PID ensures children inherit this group
-        sshProcessGroupID = getpid()
-
-        // Register atexit handler as last resort cleanup
-        atexit {
-            killProcessGroup()
-        }
-
-        Task {
-            await loadTunnels()
-            autoConnectTunnels()
-        }
-
-        // Start reconnection monitor
-        startReconnectMonitor()
+    private func setIdleStatus(_ id: UUID) {
+        guard let tunnel = tunnels.first(where: { $0.id == id }) else { statuses[id] = nil; return }
+        statuses[id] = tunnel.enabled
+            ? TunnelStatus(phase: .waiting, message: sleeping ? "睡眠暂停" : "等待网络…")
+            : TunnelStatus()
     }
 
-    private func startReconnectMonitor() {
-        reconnectTask = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
-                reconnectDisconnectedTunnels()
+    private func launchWorker(_ id: UUID) {
+        guard workers[id] == nil, wantsConnection(id) else { return }
+        workers[id] = Task { [weak self] in
+            guard let self else { return }
+            await self.run(id)
+            self.workers[id] = nil
+            if Task.isCancelled {
+                if self.wantsConnection(id) { self.launchWorker(id) }
+                else { self.setIdleStatus(id) }
             }
         }
     }
 
-    private func reconnectDisconnectedTunnels() {
-        for tunnelID in shouldBeConnected {
-            guard let tunnel = tunnels.first(where: { $0.id == tunnelID }) else {
-                shouldBeConnected.remove(tunnelID)
+    private func run(_ id: UUID) async {
+        var failures = 0
+        while !Task.isCancelled, wantsConnection(id), let tunnel = tunnels.first(where: { $0.id == id }) {
+            let command: SSHCommand
+            do { command = try SSHCommand(tunnel.command) }
+            catch {
+                statuses[id] = TunnelStatus(phase: .waiting, message: error.localizedDescription)
+                return // Invalid configuration needs an edit, not a retry storm.
+            }
+            statuses[id] = TunnelStatus(phase: .connecting, message: "正在连接…")
+            let session: any TunnelProcess
+            do { session = try factory(command) }
+            catch {
+                statuses[id] = TunnelStatus(phase: .waiting, message: "无法启动 SSH：\(error.localizedDescription)")
+                if !(await backoff(failures)) { return }
+                failures += 1
                 continue
             }
-
-            // Respawn whenever a desired-connected tunnel has no live process and
-            // isn't already starting up. Keying off process liveness (rather than
-            // the status label) is what makes auto-reconnect actually fire after a
-            // tunnel drops — handleProcessTermination leaves the status at
-            // .connecting, which the old `== .disconnected` check never matched.
-            if processIDs[tunnelID] == nil && !connectingInFlight.contains(tunnelID) {
-                beginConnecting(tunnel: tunnel)
+            if let registry {
+                do {
+                    guard let identity = session.identity else { throw CommandError("无法读取 SSH 进程身份。") }
+                    try registry.register(identity)
+                } catch {
+                    await session.stop()
+                    if let identity = session.identity { registry.remove(identity) }
+                    guard !Task.isCancelled, wantsConnection(id) else { return }
+                    statuses[id] = TunnelStatus(phase: .waiting, message: error.localizedDescription)
+                    if !(await backoff(failures)) { return }
+                    failures += 1
+                    continue
+                }
             }
-        }
-    }
-
-    /// Free the local ports, then launch the SSH process for a tunnel.
-    /// `connectingInFlight` guards against concurrent callers (a manual connect
-    /// and the reconnect monitor) racing to start two processes for one tunnel.
-    private func beginConnecting(tunnel: Tunnel) {
-        let id = tunnel.id
-        guard !connectingInFlight.contains(id) else { return }
-        connectingInFlight.insert(id)
-        connectionStatus[id] = .connecting
-
-        let tunnelCopy = tunnel
-        // Kill only *this* tunnel's own leftover process, by PID — never by a
-        // local-port pattern, which would also cut down a sibling tunnel that
-        // shares the port (e.g. a duplicated config), making them murder each
-        // other on every (re)connect. Crash orphans are handled separately at
-        // launch via the PID file.
-        let stalePID = processIDs[id]
-
-        Task.detached {
-            if let stalePID {
-                kill(stalePID, SIGKILL)
-                try? await Task.sleep(for: .milliseconds(100))
+            let began = Date()
+            var connectedAt: Date?
+            var timedOut = false
+            while !session.hasExited {
+                if Task.isCancelled || !wantsConnection(id) {
+                    await session.stop()
+                    break
+                }
+                if session.isReady && connectedAt == nil {
+                    connectedAt = Date()
+                    statuses[id] = TunnelStatus(phase: .connected, message: "已连接")
+                }
+                if connectedAt == nil && Date().timeIntervalSince(began) > timing.startupTimeout {
+                    timedOut = true
+                    await session.stop()
+                    break
+                }
+                do { try await Task.sleep(for: timing.poll) }
+                catch { await session.stop(); break }
             }
-
-            await MainActor.run {
-                self.startSSHProcess(tunnel: tunnelCopy)
-            }
+            let result = await session.wait()
+            if let identity = session.identity { registry?.remove(identity) }
+            guard !Task.isCancelled, wantsConnection(id) else { return }
+            if let connectedAt, Date().timeIntervalSince(connectedAt) > 30 { failures = 0 }
+            let reason = timedOut ? "SSH 连接超时" : Self.failure(result)
+            statuses[id] = TunnelStatus(phase: .waiting, message: "\(reason) · 自动重试中")
+            if !(await backoff(failures)) { return }
+            failures += 1
         }
     }
 
-    func loadTunnels() async {
-        items = await configStore.load()
-    }
-
-    func saveTunnels() async {
-        await configStore.save(items)
-    }
-
-    private func autoConnectTunnels() {
-        for tunnel in tunnels where tunnel.autoConnect {
-            connect(tunnel: tunnel)
-        }
-    }
-
-    func isConnected(_ tunnel: Tunnel) -> Bool {
-        connectionStatus[tunnel.id] == .connected
-    }
-
-    func status(for tunnel: Tunnel) -> ConnectionStatus {
-        connectionStatus[tunnel.id] ?? .disconnected
-    }
-
-    /// Why the tunnel last failed to connect or dropped, if it isn't currently
-    /// up. nil when it's connected or was stopped cleanly. Sticky across the
-    /// auto-reconnect retries, so the reason stays put instead of flickering.
-    func lastError(for tunnel: Tunnel) -> String? {
-        lastErrors[tunnel.id]
-    }
-
-    /// Local forward ports this tunnel shares with *other* configured tunnels.
-    /// ssh can't bind the same local port twice, so connecting both would make
-    /// the second fail to bind — this lets the UI warn before that happens.
-    /// Returns each shared port mapped to the names of the other tunnels on it.
-    func localPortConflicts(for tunnel: Tunnel) -> [Int: [String]] {
-        // Only ports bound on this Mac can clash — a remote forward (-R) binds
-        // on the server, so its port lives in a different namespace.
-        let myPorts = Set(tunnel.locallyBoundPorts)
-        guard !myPorts.isEmpty else { return [:] }
-        var conflicts: [Int: [String]] = [:]
-        for other in tunnels where other.id != tunnel.id {
-            for port in Set(other.locallyBoundPorts) where myPorts.contains(port) {
-                conflicts[port, default: []].append(other.name.isEmpty ? "Untitled" : other.name)
-            }
-        }
-        return conflicts
-    }
-
-    func connect(tunnel: Tunnel) {
-        guard !isConnected(tunnel) else { return }
-
-        // Record desired state so the monitor keeps the tunnel alive, then start.
-        shouldBeConnected.insert(tunnel.id)
-        beginConnecting(tunnel: tunnel)
-    }
-
-    private func startSSHProcess(tunnel: Tunnel) {
-        // Startup is no longer in flight, whatever the outcome below.
-        connectingInFlight.remove(tunnel.id)
-
-        // The user (or an in-place update) may have cancelled while we were
-        // freeing the local port — don't resurrect a tunnel that's no longer wanted.
-        guard shouldBeConnected.contains(tunnel.id) else {
-            connectionStatus[tunnel.id] = .disconnected
-            return
-        }
-
-        // Reject hosts that would let ssh parse the destination as an option
-        // (e.g. "-oProxyCommand=…") or that are empty — otherwise the reconnect
-        // monitor would respawn a doomed process every few seconds.
-        let host = tunnel.host.trimmingCharacters(in: .whitespaces)
-        guard !host.isEmpty, !host.hasPrefix("-") else {
-            logger.error("Refusing to start tunnel \"\(tunnel.name, privacy: .public)\": invalid host \"\(host, privacy: .public)\"")
-            shouldBeConnected.remove(tunnel.id)
-            connectionStatus[tunnel.id] = .disconnected
-            return
-        }
-
-        // Pre-flight: ssh can't bind a local port that's already taken, so don't
-        // launch a doomed process — which would also fool the local-port probe
-        // (the port reads as "open" because its real owner holds it) into a false
-        // "connected" flap. Our own prior process was already killed in
-        // beginConnecting, so an open port here means a different owner. Only
-        // locally-bound forwards count — a remote forward (-R) binds on the
-        // server, so its port isn't ours to check here.
-        if let takenPort = tunnel.locallyBoundPorts.first(where: { isLocalPortOpen($0) }) {
-            let by = localPortConflicts(for: tunnel)[takenPort]
-                .map { " by \($0.joined(separator: ", "))" } ?? ""
-            lastErrors[tunnel.id] = "Local port \(takenPort) is already in use\(by). Only one tunnel can bind it at a time."
-            connectionStatus[tunnel.id] = .connecting // keep retrying; self-heals once the port frees
-            logger.error("Tunnel \"\(tunnel.name, privacy: .public)\" cannot bind local port \(takenPort) — already in use")
-            return
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-
-        // One forward flag per port mapping — -L for a local forward, -R for a
-        // remote forward, -D for a SOCKS proxy — all carried by a single ssh
-        // process.
-        var arguments = ["-N"]
-        for mapping in tunnel.portMappings {
-            switch mapping.forward {
-            case .local:
-                arguments.append(contentsOf: [
-                    "-L", "\(mapping.localHost):\(mapping.localPort):\(mapping.remoteHost):\(mapping.remotePort)"
-                ])
-            case .remote:
-                // ssh -R [bind_address:]port:host:hostport. Fields stay consistent
-                // with -L/-D — Local* is always this Mac, Remote* the far side — so
-                // the server binds the Remote address and forwards back to the Local
-                // host:port here. (That's the reverse of -L's data direction.)
-                arguments.append(contentsOf: [
-                    "-R", "\(mapping.remoteHost):\(mapping.remotePort):\(mapping.localHost):\(mapping.localPort)"
-                ])
-            case .dynamic:
-                arguments.append(contentsOf: [
-                    "-D", "\(mapping.localHost):\(mapping.localPort)"
-                ])
-            }
-        }
-
-        // Connection options.
-        if let port = tunnel.port {
-            arguments.append(contentsOf: ["-p", String(port)])
-        }
-        if let identityFile = tunnel.identityFile, !identityFile.isEmpty {
-            arguments.append(contentsOf: ["-i", (identityFile as NSString).expandingTildeInPath])
-            // Use only this key — don't also offer every key in the ssh-agent,
-            // which can trip the server's auth-attempt limit ("Too many
-            // authentication failures") before the right key is reached.
-            arguments.append(contentsOf: ["-o", "IdentitiesOnly=yes"])
-        }
-        if tunnel.compression {
-            arguments.append("-C")
-        }
-        if tunnel.disableTCPKeepAlive {
-            arguments.append(contentsOf: ["-o", "TCPKeepAlive=no"])
-        }
-        if tunnel.skipHostKeyCheck {
-            arguments.append(contentsOf: [
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null"
-            ])
-        }
-        if let proxyJump = tunnel.proxyJump?.trimmingCharacters(in: .whitespaces), !proxyJump.isEmpty {
-            arguments.append(contentsOf: ["-J", proxyJump])
-        }
-        if let extraSSHArguments = tunnel.extraSSHArguments?.trimmingCharacters(in: .whitespacesAndNewlines), !extraSSHArguments.isEmpty {
-            do {
-                arguments.append(contentsOf: try tokenizeSSHArguments(extraSSHArguments))
-            } catch {
-                lastErrors[tunnel.id] = error.localizedDescription
-                connectionStatus[tunnel.id] = .disconnected
-                logger.error("Tunnel \"\(tunnel.name, privacy: .public)\" has invalid extra SSH arguments: \(error.localizedDescription, privacy: .public)")
-                return
-            }
-        }
-
-        // Robustness/hardening options. Forcing a dedicated, forward-only
-        // connection (RequestTTY / RemoteCommand / ControlMaster / ControlPath)
-        // stops login-oriented alias directives from allocating a TTY, running a
-        // remote shell, or piggybacking on an existing master socket and making
-        // ssh exit early — which the monitor would see as a drop and respawn,
-        // causing the tunnel to flap.
-        arguments.append(contentsOf: [
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=\(tunnel.serverAliveInterval ?? Tunnel.defaultServerAliveInterval)",
-            "-o", "ServerAliveCountMax=\(tunnel.serverAliveCountMax ?? Tunnel.defaultServerAliveCountMax)",
-            // Retry the initial connection a couple of times before giving up,
-            // and never block on an interactive prompt the GUI can't answer.
-            "-o", "ConnectionAttempts=2",
-            "-o", "BatchMode=yes",
-            "-o", "RequestTTY=no",
-            "-o", "RemoteCommand=none",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none"
-        ])
-        if let connectTimeout = tunnel.connectTimeout {
-            arguments.append(contentsOf: ["-o", "ConnectTimeout=\(connectTimeout)"])
-        }
-
-        arguments.append(host)
-
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        // Capture ssh's diagnostics so a failed/dropped tunnel has a recorded
-        // reason. `ssh -N` writes only a few lines here (well under the pipe
-        // buffer), so draining it once at exit can't deadlock the connection.
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-
+    private func backoff(_ attempt: Int) async -> Bool {
         do {
-            try process.run()
-            let pid = process.processIdentifier
-            processIDs[tunnel.id] = pid
-            connectionStatus[tunnel.id] = .connected
-
-            // Save PIDs to file for crash recovery
-            updatePIDFile()
-
-            let tunnelID = tunnel.id
-            let tunnelName = tunnel.name
-
-            // Announce the connection only once the forward is genuinely up:
-            // poll the local port (ssh binds it only on success), so the cue
-            // fires promptly on a fast connect, never on a host that just hangs,
-            // and not during a reconnect storm. Surviving this also marks the
-            // tunnel "established", which gates the disconnect feedback below.
-            // A locally-bound forward (-L/-D) lets us confirm "up" by probing its
-            // port. A pure remote forward (-R) binds on the server with nothing to
-            // probe here, so fall back to "the process survived the grace window" —
-            // ExitOnForwardFailure makes a bad -R bind exit fast, so a survivor is
-            // a reliable enough success signal.
-            let probePort = tunnel.locallyBoundPorts.first
-            Task { [weak self] in
-                if let probePort {
-                    for _ in 0..<150 { // up to ~30s while the process stays alive
-                        try? await Task.sleep(for: .milliseconds(200))
-                        let isUp = await Task.detached { isLocalPortOpen(probePort) }.value
-                        guard let self, self.processIDs[tunnelID] == pid else { return }
-                        if isUp {
-                            self.markEstablished(tunnelID: tunnelID, tunnelName: tunnelName)
-                            return
-                        }
-                    }
-                } else {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard let self, self.processIDs[tunnelID] == pid else { return }
-                    self.markEstablished(tunnelID: tunnelID, tunnelName: tunnelName)
-                }
-            }
-
-            Task.detached { [weak self] in
-                // readDataToEndOfFile blocks until ssh closes stderr (i.e. exits),
-                // so it doubles as the "wait for exit" before reading the code.
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                let exitCode = process.terminationStatus
-                let bySignal = process.terminationReason == .uncaughtSignal
-                let stderr = String(decoding: errorData, as: UTF8.self)
-                await MainActor.run { [weak self] in
-                    self?.handleProcessTermination(tunnelID: tunnelID, stderr: stderr, exitCode: exitCode, terminatedBySignal: bySignal)
-                }
-            }
-        } catch {
-            logger.error("Failed to start SSH tunnel \"\(tunnel.name, privacy: .public)\": \(error.localizedDescription, privacy: .public)")
-            connectionStatus[tunnel.id] = .disconnected
-        }
+            try await Task.sleep(for: timing.retry[min(attempt, timing.retry.count - 1)])
+            return !Task.isCancelled
+        } catch { return false }
     }
 
-    private func updatePIDFile() {
-        let pids = Array(processIDs.values)
-        if pids.isEmpty {
-            removePIDFile()
-        } else {
-            savePIDsToFile(pids)
+    private static func failure(_ result: ProcessResult) -> String {
+        let text = result.diagnostic.lowercased()
+        if text.contains("address already in use") || text.contains("cannot listen to port") {
+            return "端口已被占用（未终止其他程序）"
         }
+        if text.contains("remote port forwarding failed") { return "服务器上的转发端口被占用或未获允许" }
+        if text.contains("permission denied") { return "SSH 认证失败，请检查密钥或 ssh-agent" }
+        if text.contains("host key verification failed") || text.contains("remote host identification has changed") {
+            return "请先在终端确认 SSH 主机密钥"
+        }
+        return result.diagnostic.split(whereSeparator: \.isNewline).last.map(String.init)
+            ?? "SSH 已断开（\(result.status)）"
     }
 
-    /// Mark a tunnel as genuinely up: clear any stale failure reason and, the
-    /// first time it establishes, fire the connect cue. Shared by the local-port
-    /// probe and the remote-forward survival path.
-    private func markEstablished(tunnelID: UUID, tunnelName: String) {
-        lastErrors.removeValue(forKey: tunnelID)
-        if establishedTunnels.insert(tunnelID).inserted {
-            TunnelSound.playConnected()
-            TunnelNotification.notifyConnected(tunnelName: tunnelName)
-        }
+    func shutdown() async {
+        shuttingDown = true
+        let tasks = Array(workers.values)
+        tasks.forEach { $0.cancel() }
+        for task in tasks { await task.value }
+        registry = nil
     }
-
-    private func handleProcessTermination(tunnelID: UUID, stderr: String, exitCode: Int32, terminatedBySignal: Bool) {
-        processIDs.removeValue(forKey: tunnelID)
-        let wasEstablished = establishedTunnels.remove(tunnelID) != nil
-        // A clean exit (status 0) or a process we/something signalled, with no
-        // diagnostics on stderr, isn't a connection failure worth flagging — it's
-        // an internal restart or external kill, not "auth failed"/"refused".
-        let cleanStop = stderr.isEmpty && (exitCode == 0 || terminatedBySignal)
-        // If should still be connected, mark as connecting (will trigger reconnect)
-        // Otherwise mark as disconnected
-        if shouldBeConnected.contains(tunnelID) {
-            connectionStatus[tunnelID] = .connecting
-            // Record *why* it failed/dropped. Sticky: it persists through the
-            // reconnect retries and is cleared only once the tunnel establishes
-            // (grace task) or the user stops it (disconnect) — so the UI shows a
-            // stable reason instead of a bare spinner, and never flickers.
-            if !cleanStop {
-                lastErrors[tunnelID] = classifyFailure(stderr: stderr, exitCode: exitCode)
-            }
-            // Announce only genuine drops of connections that were actually up.
-            // A manual disconnect clears shouldBeConnected first (silent), a flap
-            // never became "established" (silent), and a clean internal restart
-            // isn't a drop — so no nuisance beeps.
-            if wasEstablished && !cleanStop {
-                let tunnelName = tunnels.first(where: { $0.id == tunnelID })?.name ?? "Tunnel"
-                TunnelSound.playDisconnected()
-                TunnelNotification.notifyDisconnected(tunnelName: tunnelName)
-            }
-        } else {
-            connectionStatus[tunnelID] = .disconnected
-        }
-        updatePIDFile()
-    }
-
-    /// Best-effort mapping of ssh's stderr to a short, human-readable reason.
-    /// OpenSSH wording isn't a stable API and varies by version/locale, so this
-    /// degrades gracefully: a known phrase → a friendly line, otherwise the last
-    /// non-empty stderr line, otherwise the exit code. It is never blank.
-    private func classifyFailure(stderr: String, exitCode: Int32) -> String {
-        let s = stderr.lowercased()
-        if s.contains("permission denied")
-            || s.contains("too many authentication failures")
-            || s.contains("no more authentication methods") {
-            return "Authentication failed — check your key or identity file."
-        }
-        if s.contains("connection refused") {
-            return "Connection refused — the SSH server may be down or on another port."
-        }
-        if s.contains("operation timed out")
-            || s.contains("connection timed out")
-            || s.contains("no route to host")
-            || s.contains("network is unreachable") {
-            return "Host unreachable — check the network or a firewall."
-        }
-        if s.contains("could not resolve hostname")
-            || s.contains("name or service not known")
-            || s.contains("nodename nor servname") {
-            return "Couldn’t resolve the host name (DNS)."
-        }
-        if s.contains("host key verification failed")
-            || s.contains("remote host identification has changed") {
-            return "Host key changed — enable “Skip host key check” if the host was recreated."
-        }
-        if s.contains("address already in use") || s.contains("cannot listen to port") {
-            return "A local forward port is already in use."
-        }
-        if s.contains("remote port forwarding failed") {
-            return "The server couldn’t bind the remote-forward port — it may already be in use there (or needs root for a port below 1024)."
-        }
-        if s.contains("administratively prohibited") || s.contains("open failed") {
-            return "The server refused the port forward."
-        }
-        // Unknown wording — surface the last meaningful stderr line, else the code.
-        if let line = stderr
-            .split(whereSeparator: \.isNewline)
-            .map({ $0.trimmingCharacters(in: .whitespaces) })
-            .last(where: { !$0.isEmpty }) {
-            return line
-        }
-        return "Disconnected unexpectedly (ssh exit \(exitCode))."
-    }
-
-    func disconnect(tunnel: Tunnel) {
-        // Remove from auto-reconnect set and cancel any in-flight startup
-        shouldBeConnected.remove(tunnel.id)
-        connectingInFlight.remove(tunnel.id)
-        establishedTunnels.remove(tunnel.id)
-        // A deliberate stop is not a failure — clear any recorded reason.
-        lastErrors.removeValue(forKey: tunnel.id)
-
-        guard let pid = processIDs[tunnel.id] else {
-            connectionStatus[tunnel.id] = .disconnected
-            return
-        }
-
-        // Send SIGTERM first, then SIGKILL after brief delay
-        kill(pid, SIGTERM)
-
-        // Give process time to terminate gracefully
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-            kill(pid, SIGKILL) // Force kill if still alive
-        }
-
-        processIDs.removeValue(forKey: tunnel.id)
-        connectionStatus[tunnel.id] = .disconnected
-        updatePIDFile()
-    }
-
-    func toggle(tunnel: Tunnel) {
-        // Key off desired state so a tunnel that's connecting/reconnecting can be
-        // cancelled — isConnected alone (only .connected) would re-trigger connect
-        // even though the UI already shows .connecting as "on".
-        if shouldBeConnected.contains(tunnel.id) || isConnected(tunnel) {
-            disconnect(tunnel: tunnel)
-        } else {
-            connect(tunnel: tunnel)
-        }
-    }
-
-    // MARK: - Groups
-
-    /// A group counts as "on" only when every tunnel in it is connected or
-    /// desired-connected — so a half-on group reads as off and one tap fills it in.
-    func isGroupActive(_ groupTunnels: [Tunnel]) -> Bool {
-        guard !groupTunnels.isEmpty else { return false }
-        return groupTunnels.allSatisfy { shouldBeConnected.contains($0.id) || isConnected($0) }
-    }
-
-    /// Connect every tunnel in the group, or disconnect them all if already on.
-    func toggleGroup(_ groupTunnels: [Tunnel]) {
-        if isGroupActive(groupTunnels) {
-            for tunnel in groupTunnels { disconnect(tunnel: tunnel) }
-        } else {
-            for tunnel in groupTunnels { connect(tunnel: tunnel) }
-        }
-    }
-
-    // MARK: - Dividers
-
-    /// Insert a standalone divider after the given tunnel (or at the top when
-    /// nothing is selected). It can then be dragged anywhere in the list.
-    /// Returns the new divider so the caller can prompt for a name.
-    @discardableResult
-    func addDivider(after tunnelID: UUID?) -> GroupDivider {
-        let divider = GroupDivider()
-        let item = SidebarItem.divider(divider)
-        if let id = tunnelID, let index = items.firstIndex(where: { $0.id == id }) {
-            items.insert(item, at: index + 1)
-        } else {
-            items.insert(item, at: 0)
-        }
-        Task { await saveTunnels() }
-        return divider
-    }
-
-    func renameDivider(_ id: UUID, title: String) {
-        guard let index = items.firstIndex(where: { $0.id == id }),
-              case .divider(var divider) = items[index] else { return }
-        divider.title = title
-        items[index] = .divider(divider)
-        Task { await saveTunnels() }
-    }
-
-    func deleteDivider(_ id: UUID) {
-        items.removeAll { $0.divider?.id == id }
-        Task { await saveTunnels() }
-    }
-
-    // MARK: - Tunnel CRUD
-
-    func addTunnel() {
-        let newTunnel = Tunnel(
-            name: "New Tunnel",
-            host: "user@example.com",
-            port: nil
-        )
-        items.append(.tunnel(newTunnel))
-        Task { await saveTunnels() }
-    }
-
-    func deleteTunnel(_ tunnel: Tunnel) {
-        if isConnected(tunnel) {
-            disconnect(tunnel: tunnel)
-        }
-        items.removeAll { $0.tunnel?.id == tunnel.id }
-        Task { await saveTunnels() }
-    }
-
-    func updateTunnel(_ tunnel: Tunnel) {
-        guard let index = items.firstIndex(where: { $0.tunnel?.id == tunnel.id }),
-              let existing = items[index].tunnel else { return }
-
-        // Restart an active tunnel so new settings take effect (the old code
-        // disconnected but never reconnected). Skip the restart when only
-        // cosmetic fields like the name changed, to avoid needless flapping —
-        // the detail view auto-saves on every focus change.
-        let wasActive = shouldBeConnected.contains(tunnel.id) || processIDs[tunnel.id] != nil
-        let needsRestart = wasActive && !existing.hasSameConnection(as: tunnel)
-        if needsRestart {
-            disconnect(tunnel: existing)
-        }
-        items[index] = .tunnel(tunnel)
-        Task { await saveTunnels() }
-        if needsRestart {
-            connect(tunnel: tunnel)
-        }
-    }
-
-    /// Reorder sidebar items (tunnels and dividers) — used by drag-and-drop.
-    func moveItems(from source: IndexSet, to destination: Int) {
-        items.move(fromOffsets: source, toOffset: destination)
-        Task { await saveTunnels() }
-    }
-
-    func canMoveUp(id: UUID) -> Bool {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return false }
-        return index > 0
-    }
-
-    func canMoveDown(id: UUID) -> Bool {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return false }
-        return index < items.count - 1
-    }
-
-    func moveItemUp(id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }), index > 0 else { return }
-        items.swapAt(index, index - 1)
-        Task { await saveTunnels() }
-    }
-
-    func moveItemDown(id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }), index < items.count - 1 else { return }
-        items.swapAt(index, index + 1)
-        Task { await saveTunnels() }
-    }
-
-    func cloneTunnel(_ tunnel: Tunnel) -> Tunnel {
-        var clone = tunnel
-        clone.id = UUID()
-        clone.name = "\(tunnel.name) (Copy)"
-        if let index = items.firstIndex(where: { $0.tunnel?.id == tunnel.id }) {
-            items.insert(.tunnel(clone), at: index + 1)
-        } else {
-            items.append(.tunnel(clone))
-        }
-        Task { await saveTunnels() }
-        return clone
-    }
-
-    /// Disconnect all tunnels - called on app termination
-    func disconnectAll() {
-        // Stop reconnection monitor
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        shouldBeConnected.removeAll()
-        connectingInFlight.removeAll()
-        establishedTunnels.removeAll()
-
-        let pids = Array(processIDs.values)
-
-        // Kill all tracked processes immediately with SIGKILL
-        for pid in pids {
-            kill(pid, SIGKILL)
-        }
-
-        // Also kill by local port pattern as backup (catches any missed processes)
-        for tunnel in tunnels {
-            killSSHProcessesForTunnel(tunnel)
-        }
-
-        processIDs.removeAll()
-        for tunnel in tunnels {
-            connectionStatus[tunnel.id] = .disconnected
-        }
-
-        // Clean up PID file
-        removePIDFile()
-    }
-
-    /// Synchronous disconnect for use in signal handlers (non-async context)
-    nonisolated func disconnectAllSync() {
-        // Read PIDs file directly since we can't access actor state
-        if let content = try? String(contentsOf: pidFileURL, encoding: .utf8) {
-            let pids = content.components(separatedBy: "\n").compactMap { Int32($0) }
-            for pid in pids {
-                kill(pid, SIGKILL)
-            }
-        }
-        // Kill process group as ultimate fallback
-        killProcessGroup()
-        removePIDFile()
-    }
-
 }

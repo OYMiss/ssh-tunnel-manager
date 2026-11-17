@@ -2,177 +2,58 @@ import SwiftUI
 
 @MainActor
 struct TunnelListView: View {
-    @Environment(TunnelManager.self) private var tunnelManager
-    @Binding var selection: UUID?
+    @Environment(TunnelManager.self) private var manager
+    var edit: (Tunnel) -> Void
+    var delete: (Tunnel) -> Void
 
     var body: some View {
-        List(selection: $selection) {
-            ForEach(tunnelManager.items) { item in
-                switch item {
-                case .tunnel(let tunnel):
-                    TunnelRow(tunnel: tunnel)
-                        .tag(tunnel.id)
-                        .contextMenu {
-                            Button {
-                                tunnelManager.moveItemUp(id: tunnel.id)
-                            } label: {
-                                Label("Move Up", systemImage: "arrow.up")
-                            }
-                            .disabled(!tunnelManager.canMoveUp(id: tunnel.id))
-
-                            Button {
-                                tunnelManager.moveItemDown(id: tunnel.id)
-                            } label: {
-                                Label("Move Down", systemImage: "arrow.down")
-                            }
-                            .disabled(!tunnelManager.canMoveDown(id: tunnel.id))
-
-                            Divider()
-
-                            Button {
-                                let clone = tunnelManager.cloneTunnel(tunnel)
-                                selection = clone.id
-                            } label: {
-                                Label("Clone", systemImage: "doc.on.doc")
-                            }
-
-                            Button {
-                                let divider = tunnelManager.addDivider(after: tunnel.id)
-                                selection = divider.id
-                            } label: {
-                                Label("Add Divider Below", systemImage: "rectangle.dashed")
-                            }
-
-                            Divider()
-
-                            Button(role: .destructive) {
-                                if selection == tunnel.id { selection = nil }
-                                tunnelManager.deleteTunnel(tunnel)
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
+        List {
+            ForEach(manager.tunnels) { tunnel in
+                let status = manager.status(for: tunnel)
+                HStack(alignment: .top, spacing: 12) {
+                    StatusIndicator(phase: status.phase)
+                        .padding(.top, 6)
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text(tunnel.displayName).font(.headline)
+                            Text(tunnel.portSummary)
+                                .font(.system(.subheadline, design: .monospaced))
+                                .foregroundStyle(.secondary)
                         }
-                case .divider(let divider):
-                    DividerRow(divider: divider)
-                        .tag(divider.id)
-                        .contextMenu {
-                            Button {
-                                tunnelManager.moveItemUp(id: divider.id)
-                            } label: {
-                                Label("Move Up", systemImage: "arrow.up")
-                            }
-                            .disabled(!tunnelManager.canMoveUp(id: divider.id))
-
-                            Button {
-                                tunnelManager.moveItemDown(id: divider.id)
-                            } label: {
-                                Label("Move Down", systemImage: "arrow.down")
-                            }
-                            .disabled(!tunnelManager.canMoveDown(id: divider.id))
-
-                            Divider()
-
-                            Button(role: .destructive) {
-                                if selection == divider.id { selection = nil }
-                                tunnelManager.deleteDivider(divider.id)
-                            } label: {
-                                Label("Delete Divider", systemImage: "trash")
-                            }
-                        }
+                        Text(tunnel.command)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                        Text(status.message)
+                            .font(.caption)
+                            .foregroundStyle(status.phase == .waiting ? .orange : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("编辑", systemImage: "pencil") { edit(tunnel) }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .help("编辑隧道")
+                    Toggle("连接 \(tunnel.displayName)", isOn: Binding(
+                        get: { tunnel.enabled },
+                        set: { manager.setEnabled($0, for: tunnel.id) }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
                 }
-            }
-            .onMove { tunnelManager.moveItems(from: $0, to: $1) }
-            .onDelete(perform: deleteItems)
-        }
-        .listStyle(.sidebar)
-    }
-
-    private func deleteItems(at offsets: IndexSet) {
-        // Resolve items before mutating, since deletes shift indices.
-        let targets = offsets.map { tunnelManager.items[$0] }
-        for item in targets {
-            if selection == item.id { selection = nil }
-            switch item {
-            case .tunnel(let tunnel):
-                tunnelManager.deleteTunnel(tunnel)
-            case .divider(let divider):
-                tunnelManager.deleteDivider(divider.id)
-            }
-        }
-    }
-}
-
-@MainActor
-struct TunnelRow: View {
-    let tunnel: Tunnel
-    @Environment(TunnelManager.self) private var tunnelManager
-
-    private var lastError: String? {
-        tunnelManager.lastError(for: tunnel)
-    }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            StatusIndicator(status: tunnelManager.status(for: tunnel), size: 8, isFailed: lastError != nil)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tunnel.name)
-                    .fontWeight(.medium)
-                    .lineLimit(1)
-
-                if let lastError {
-                    Text(lastError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                } else {
-                    Text(tunnel.mappingsSummary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                .padding(.vertical, 8)
+                .contextMenu {
+                    Button("编辑隧道", systemImage: "pencil") { edit(tunnel) }
+                    Button("复制命令", systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(tunnel.command, forType: .string)
+                    }
+                    Divider()
+                    Button("删除", systemImage: "trash", role: .destructive) { delete(tunnel) }
                 }
             }
         }
-        .padding(.vertical, 2)
-        .help(lastError ?? "")
+        .listStyle(.inset)
     }
-}
-
-/// A standalone group divider row. Select it to edit its name in the detail
-/// pane; reorder it with the ↑↓ buttons or by dragging.
-@MainActor
-struct DividerRow: View {
-    let divider: GroupDivider
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "line.horizontal.3")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            if divider.title.isEmpty {
-                Text("New group")
-                    .font(.caption2)
-                    .italic()
-                    .foregroundStyle(.tertiary)
-            } else {
-                Text(divider.title.uppercased())
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Rectangle()
-                .fill(.secondary.opacity(0.25))
-                .frame(height: 1)
-        }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-    }
-}
-
-#Preview {
-    TunnelListView(selection: .constant(nil))
-        .environment(TunnelManager())
-        .frame(width: 250)
 }
