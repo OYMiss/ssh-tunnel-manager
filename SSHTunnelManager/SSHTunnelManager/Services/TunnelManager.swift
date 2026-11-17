@@ -57,7 +57,7 @@ final class TunnelManager {
     func status(for tunnel: Tunnel) -> TunnelStatus { statuses[tunnel.id] ?? TunnelStatus() }
 
     @discardableResult
-    func save(command: String, replacing id: UUID? = nil) throws -> UUID {
+    func save(command: String, name: String? = nil, replacing id: UUID? = nil) throws -> UUID {
         let command = command.trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try SSHCommand(command)
         guard isLoaded, !shuttingDown else { throw CommandError("配置尚未加载。") }
@@ -65,9 +65,10 @@ final class TunnelManager {
         let tunnelID: UUID
         if let id, let index = updated.firstIndex(where: { $0.id == id }) {
             updated[index].command = command
+            if let name { updated[index].name = name.trimmingCharacters(in: .whitespacesAndNewlines) }
             tunnelID = id
         } else {
-            let new = Tunnel(command: command)
+            let new = Tunnel(name: name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "", command: command)
             updated.append(new)
             tunnelID = new.id
         }

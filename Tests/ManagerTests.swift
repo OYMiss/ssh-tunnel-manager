@@ -67,6 +67,25 @@ final class ManagerTests: XCTestCase {
         return (manager, factory, tunnel.id, directory)
     }
 
+    func testRenamePersistsWithoutRestartingConnection() async throws {
+        let (manager, factory, id, directory) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let command = manager.tunnels[0].command
+        try manager.save(command: command, name: "  我的代理  ", replacing: id)
+        XCTAssertEqual(manager.tunnels[0].displayName, "我的代理")
+        XCTAssertEqual(try ConfigStore(directory: directory).load()[0].name, "我的代理")
+        try manager.save(command: command, replacing: id)
+        XCTAssertEqual(manager.tunnels[0].name, "我的代理")
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(factory.processes.count, 1)
+        XCTAssertFalse(factory.processes[0].hasExited)
+        XCTAssertTrue(manager.tunnels[0].enabled)
+        try manager.save(command: command, name: "   ", replacing: id)
+        XCTAssertEqual(manager.tunnels[0].displayName, "test-alias")
+        XCTAssertEqual(try ConfigStore(directory: directory).load()[0].name, "")
+        await manager.shutdown()
+    }
+
     func testRapidOffOnNeverOverlapsProcesses() async throws {
         let (manager, factory, id, directory) = try await fixture()
         defer { try? FileManager.default.removeItem(at: directory) }

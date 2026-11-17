@@ -11,6 +11,7 @@ struct TunnelDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var mode: Mode
     @State private var setup: TunnelSetup
+    @State private var name: String
     @State private var command: String
     @State private var lastGeneratedCommand: String?
     @State private var modeMessage: String?
@@ -23,6 +24,7 @@ struct TunnelDetailView: View {
         initialSetup = setup
         _setup = State(initialValue: setup ?? TunnelSetup())
         _mode = State(initialValue: original == nil || setup != nil ? .simple : .manual)
+        _name = State(initialValue: original?.name ?? "")
         _command = State(initialValue: original?.command ?? "")
     }
 
@@ -52,6 +54,8 @@ struct TunnelDetailView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    field("连接名称（可选）", prompt: "留空使用 SSH 目标", text: $name)
+                        .textFieldStyle(.roundedBorder)
                     if mode == .simple { simpleEditor } else { commandEditor }
                     if let modeMessage { Text(modeMessage).font(.caption).foregroundStyle(.orange) }
                     if case .failure(let error) = validation, !isEmpty {
@@ -72,7 +76,7 @@ struct TunnelDetailView: View {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("保存") {
-                    do { try manager.save(command: currentCommand, replacing: original?.id); dismiss() }
+                    do { try manager.save(command: currentCommand, name: name, replacing: original?.id); dismiss() }
                     catch { saveError = error.localizedDescription }
                 }
                 .keyboardShortcut(.defaultAction)
